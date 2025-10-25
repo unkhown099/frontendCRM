@@ -817,7 +817,7 @@
                     <span class="breadcrumb-separator">/</span>
                     <span>Dashboard</span>
                 </div>
-                <h1 class="page-title">Sales Dashboard</h1>
+                <h1 class="page-title">Crm Dashboard</h1>
                 <p class="page-subtitle">Track and manage your sales pipeline in real-time</p>
             </div>
             <div class="header-actions">
