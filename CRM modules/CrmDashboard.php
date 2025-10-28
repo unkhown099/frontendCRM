@@ -39,10 +39,9 @@ $userId = $_SESSION['user_id'];
             </div>
             <ul class="nav-menu">
                 <li><a href="#" class="active">Dashboard</a></li>
-                <li><a href="./leadsManagement.php">Leads</a></li>
-                <li><a href="./contactManagement.php">Contacts</a></li>
-                <li><a href="./dealsManagement.php">Deals</a></li>
-                <li><a href="./tasksManagement.php">Tasks</a></li>
+                <li><a href="./customerProfile.php">Customer Profiles</a></li>
+                <li><a href="./loyaltyProgram.php">Loyalty Program</a></li>
+                <li><a href="./customerSupport.php">Customer Support</a></li>
                 <li><a href="./reportsManagement.php">Reports & Analytics</a></li>
             </ul>
             <div class="nav-right">
@@ -54,7 +53,7 @@ $userId = $_SESSION['user_id'];
                     🔔
                     <span class="notification-badge">5</span>
                 </button>
-                <div class="user-avatar">JD</div>
+                <a href="./crmProfile.php"><div class="user-avatar">JD</div></a>
             </div>
         </div>
     </nav>
