@@ -1,3 +1,128 @@
+<?php
+session_start();
+// Backend: prepare DB-driven data for the Customer Profiles page
+require_once __DIR__ . '/../config/database.php';
+
+if (!isset($_SESSION['user_id'])) {
+    header('Location: ../login.php');
+    exit;
+}
+
+$pdo = Database::getInstance()->getConnection();
+
+$totalCustomers = 0;
+$vipCustomers = 0;
+$totalLoyaltyPoints = 0;
+$newThisMonth = 0;
+$customers = [];
+
+try {
+    $monthStart = date('Y-m-01');
+    $monthEnd = date('Y-m-t');
+
+    // total customers
+    $stmt = $pdo->query("SELECT COUNT(*) FROM customers");
+    $totalCustomers = (int)$stmt->fetchColumn();
+
+    // pagination
+    $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
+    $perPage = 10; // rows per page
+    $offset = ($page - 1) * $perPage;
+
+    // VIP customers heuristic: customers with high loyalty points
+    $vipThreshold = 500; // loyalty points threshold for VIP
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM customers WHERE LoyaltyPoints >= ?");
+    $stmt->execute([$vipThreshold]);
+    $vipCustomers = (int)$stmt->fetchColumn();
+
+    // total loyalty points: prefer loyalty_accounts if present
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'loyalty_accounts'");
+    $stmt->execute();
+    if ($stmt->fetchColumn() > 0) {
+        $stmt2 = $pdo->query("SELECT IFNULL(SUM(points_balance),0) FROM loyalty_accounts");
+        $totalLoyaltyPoints = (int)$stmt2->fetchColumn();
+    } else {
+        $stmt2 = $pdo->query("SELECT IFNULL(SUM(LoyaltyPoints),0) FROM customers");
+        $totalLoyaltyPoints = (int)$stmt2->fetchColumn();
+    }
+
+    // new customers this month
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM customers WHERE CreatedAt BETWEEN ? AND ?");
+    $stmt->execute([$monthStart . ' 00:00:00', $monthEnd . ' 23:59:59']);
+    $newThisMonth = (int)$stmt->fetchColumn();
+
+    // Fetch customers
+    $stmt = $pdo->prepare("SELECT CustomerID, FirstName, LastName, Email, Phone, LoyaltyPoints, Status, CreatedAt FROM customers ORDER BY FirstName LIMIT ? OFFSET ?");
+    $stmt->execute([(int)$perPage, (int)$offset]);
+    $custRows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $totalPages = $perPage > 0 ? (int)ceil($totalCustomers / $perPage) : 1;
+
+    foreach ($custRows as $r) {
+        $cid = $r['CustomerID'];
+        $name = trim((($r['FirstName'] ?? '') . ' ' . ($r['LastName'] ?? '')));
+        if ($name === '') $name = 'Customer';
+        $initials = '';
+        foreach (preg_split('/\s+/', $name) as $p) { $initials .= strtoupper(substr($p,0,1)); }
+
+        // points
+        $points = 0;
+        $stmtCheck = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'loyalty_accounts'");
+        $stmtCheck->execute();
+        if ($stmtCheck->fetchColumn() > 0) {
+            $s2 = $pdo->prepare("SELECT IFNULL(points_balance,0) FROM loyalty_accounts WHERE CustomerID = ? LIMIT 1");
+            $s2->execute([$cid]);
+            $points = (int)$s2->fetchColumn();
+        } else {
+            // use LoyaltyPoints column from customers table per ERPSCHEMA.sql
+            $s2 = $pdo->prepare("SELECT IFNULL(LoyaltyPoints,0) FROM customers WHERE CustomerID = ? LIMIT 1");
+            $s2->execute([$cid]);
+            $points = (int)$s2->fetchColumn();
+        }
+
+        // total purchases and last purchase
+        $s3 = $pdo->prepare("SELECT IFNULL(SUM(TotalAmount),0) as total, IFNULL(MAX(SaleDate), NULL) as last_sale FROM sales WHERE CustomerID = ?");
+        $s3->execute([$cid]);
+        $salesRow = $s3->fetch(PDO::FETCH_ASSOC);
+        $totalPurchases = $salesRow ? (float)$salesRow['total'] : 0.0;
+        $lastPurchase = $salesRow && $salesRow['last_sale'] ? date('M d, Y', strtotime($salesRow['last_sale'])) : '—';
+
+    // determine tier
+    $tier = 'Bronze';
+    if ($points >= 1000) $tier = 'Platinum';
+    elseif ($points >= 500) $tier = 'Gold';
+    elseif ($points >= 100) $tier = 'Silver';
+
+        $customers[] = [
+            'id' => '#CUST-' . $cid,
+            'name' => $name,
+            'initials' => $initials,
+            'email' => $r['Email'] ?? '',
+            'phone' => $r['Phone'] ?? '',
+            // no CustomerType column in schema; infer VIP by points otherwise Retail
+            'type' => ($points >= $vipThreshold ? 'VIP' : 'Retail'),
+            'points' => $points,
+            'tier' => $tier,
+            'total_purchases' => '₱' . number_format($totalPurchases,2),
+            'last_purchase' => $lastPurchase,
+            'status' => 'Active'
+        ];
+    }
+
+} catch (Exception $e) {
+    // keep defaults if DB queries fail
+}
+
+// prepare stats array for UI
+$stats_dynamic = [
+    ['icon'=>'👥','value'=>number_format($totalCustomers),'label'=>'Total Customers','sublabel'=>'Active accounts','trend'=>'+0.0%','trend_dir'=>'up','color'=>'#dbeafe'],
+    ['icon'=>'⭐','value'=>number_format($vipCustomers),'label'=>'VIP Customers','sublabel'=>'Loyalty tier 3+','trend'=>'+0.0%','trend_dir'=>'up','color'=>'#fef3c7'],
+    ['icon'=>'🎁','value'=>number_format($totalLoyaltyPoints),'label'=>'Total Loyalty Points','sublabel'=>'Redeemable','trend'=>'+0.0%','trend_dir'=>'up','color'=>'#e9d5ff'],
+    ['icon'=>'🆕','value'=>number_format($newThisMonth),'label'=>'New This Month','sublabel'=>'vs last month','trend'=>'+0.0%','trend_dir'=>'up','color'=>'#d1fae5']
+];
+
+?>
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -67,44 +192,7 @@
         <!-- Stats Grid -->
         <div class="stats-grid">
             <?php
-            $stats = [
-                [
-                    'icon' => '👥',
-                    'value' => '2,847',
-                    'label' => 'Total Customers',
-                    'sublabel' => 'Active accounts',
-                    'trend' => '+12.5%',
-                    'trend_dir' => 'up',
-                    'color' => '#dbeafe'
-                ],
-                [
-                    'icon' => '⭐',
-                    'value' => '892',
-                    'label' => 'VIP Customers',
-                    'sublabel' => 'Loyalty tier 3+',
-                    'trend' => '+8.2%',
-                    'trend_dir' => 'up',
-                    'color' => '#fef3c7'
-                ],
-                [
-                    'icon' => '🎁',
-                    'value' => '45,678',
-                    'label' => 'Total Loyalty Points',
-                    'sublabel' => 'Redeemable',
-                    'trend' => '+15.3%',
-                    'trend_dir' => 'up',
-                    'color' => '#e9d5ff'
-                ],
-                [
-                    'icon' => '🆕',
-                    'value' => '156',
-                    'label' => 'New This Month',
-                    'sublabel' => 'vs 128 last month',
-                    'trend' => '+21.9%',
-                    'trend_dir' => 'up',
-                    'color' => '#d1fae5'
-                ]
-            ];
+            $stats = $stats_dynamic;
 
             foreach ($stats as $stat) {
                 echo '<div class="stat-card">';
@@ -174,7 +262,7 @@
         <!-- Customer Table -->
         <div class="content-card">
             <div class="card-header">
-                <h2 class="section-title">All Customers (2,847)</h2>
+                <h2 class="section-title">All Customers (<?php echo number_format($totalCustomers) ?>)</h2>
                 <div class="card-actions">
                     <button class="icon-btn" title="Filter">🔽</button>
                     <button class="icon-btn" title="Sort">⇅</button>
@@ -200,113 +288,7 @@
                     </thead>
                     <tbody>
                         <?php
-                        $customers = [
-                            [
-                                'id' => '#CUST-001',
-                                'name' => 'John Santos',
-                                'initials' => 'JS',
-                                'email' => 'john.santos@email.com',
-                                'phone' => '+63 917 123 4567',
-                                'type' => 'VIP',
-                                'points' => 1250,
-                                'tier' => 'Platinum',
-                                'total_purchases' => '₱125,450',
-                                'last_purchase' => '2 days ago',
-                                'status' => 'Active'
-                            ],
-                            [
-                                'id' => '#CUST-002',
-                                'name' => 'Maria Garcia',
-                                'initials' => 'MG',
-                                'email' => 'maria.garcia@email.com',
-                                'phone' => '+63 918 234 5678',
-                                'type' => 'Retail',
-                                'points' => 680,
-                                'tier' => 'Gold',
-                                'total_purchases' => '₱68,200',
-                                'last_purchase' => '5 days ago',
-                                'status' => 'Active'
-                            ],
-                            [
-                                'id' => '#CUST-003',
-                                'name' => 'Robert Chen',
-                                'initials' => 'RC',
-                                'email' => 'robert.chen@email.com',
-                                'phone' => '+63 919 345 6789',
-                                'type' => 'Wholesale',
-                                'points' => 2450,
-                                'tier' => 'Platinum',
-                                'total_purchases' => '₱245,800',
-                                'last_purchase' => '1 day ago',
-                                'status' => 'Active'
-                            ],
-                            [
-                                'id' => '#CUST-004',
-                                'name' => 'Ana Reyes',
-                                'initials' => 'AR',
-                                'email' => 'ana.reyes@email.com',
-                                'phone' => '+63 920 456 7890',
-                                'type' => 'Retail',
-                                'points' => 320,
-                                'tier' => 'Silver',
-                                'total_purchases' => '₱32,150',
-                                'last_purchase' => '1 week ago',
-                                'status' => 'Active'
-                            ],
-                            [
-                                'id' => '#CUST-005',
-                                'name' => 'David Lim',
-                                'initials' => 'DL',
-                                'email' => 'david.lim@email.com',
-                                'phone' => '+63 921 567 8901',
-                                'type' => 'VIP',
-                                'points' => 1580,
-                                'tier' => 'Platinum',
-                                'total_purchases' => '₱158,900',
-                                'last_purchase' => '3 days ago',
-                                'status' => 'Active'
-                            ],
-                            [
-                                'id' => '#CUST-006',
-                                'name' => 'Sarah Tan',
-                                'initials' => 'ST',
-                                'email' => 'sarah.tan@email.com',
-                                'phone' => '+63 922 678 9012',
-                                'type' => 'Retail',
-                                'points' => 85,
-                                'tier' => 'Bronze',
-                                'total_purchases' => '₱8,450',
-                                'last_purchase' => '2 weeks ago',
-                                'status' => 'Active'
-                            ],
-                            [
-                                'id' => '#CUST-007',
-                                'name' => 'Michael Cruz',
-                                'initials' => 'MC',
-                                'email' => 'michael.cruz@email.com',
-                                'phone' => '+63 923 789 0123',
-                                'type' => 'Wholesale',
-                                'points' => 890,
-                                'tier' => 'Gold',
-                                'total_purchases' => '₱89,600',
-                                'last_purchase' => '4 days ago',
-                                'status' => 'Active'
-                            ],
-                            [
-                                'id' => '#CUST-008',
-                                'name' => 'Lisa Wong',
-                                'initials' => 'LW',
-                                'email' => 'lisa.wong@email.com',
-                                'phone' => '+63 924 890 1234',
-                                'type' => 'Retail',
-                                'points' => 45,
-                                'tier' => 'Bronze',
-                                'total_purchases' => '₱4,280',
-                                'last_purchase' => '1 month ago',
-                                'status' => 'Inactive'
-                            ]
-                        ];
-
+                        // $customers array is prepared by backend queries at the top of the file
                         foreach ($customers as $customer) {
                             // Determine tier badge class
                             $tierClass = match($customer['tier']) {
@@ -362,17 +344,30 @@
                 </table>
             </div>
             <div class="table-footer">
+                <?php
+                    $start = $offset + 1;
+                    $end = min($offset + $perPage, $totalCustomers);
+                ?>
                 <div class="showing-text">
-                    Showing <strong>1-8</strong> of <strong>2,847</strong> customers
+                    Showing <strong><?php echo $start ?>-<?php echo $end ?></strong> of <strong><?php echo number_format($totalCustomers) ?></strong> customers
                 </div>
                 <div class="pagination">
-                    <button>‹</button>
-                    <button class="active">1</button>
-                    <button>2</button>
-                    <button>3</button>
-                    <button>4</button>
-                    <button>5</button>
-                    <button>›</button>
+                    <?php if ($page > 1): ?>
+                        <a href="?page=<?php echo ($page - 1) ?>" class="btn">‹</a>
+                    <?php endif; ?>
+
+                    <?php
+                    $maxPagesToShow = 7;
+                    $startPage = max(1, min($page - floor($maxPagesToShow/2), max(1, $totalPages - $maxPagesToShow + 1)));
+                    $endPage = min($startPage + $maxPagesToShow - 1, $totalPages);
+                    for ($i = $startPage; $i <= $endPage; $i++):
+                    ?>
+                        <a href="?page=<?php echo $i ?>" class="btn <?php echo ($i == $page ? 'active' : '') ?>"><?php echo $i ?></a>
+                    <?php endfor; ?>
+
+                    <?php if ($page < $totalPages): ?>
+                        <a href="?page=<?php echo ($page + 1) ?>" class="btn">›</a>
+                    <?php endif; ?>
                 </div>
             </div>
         </div>
@@ -567,15 +562,17 @@
             });
         }
 
-        // Pagination
-        document.querySelectorAll('.pagination button').forEach(btn => {
-            btn.addEventListener('click', function() {
-                if (this.textContent !== '‹' && this.textContent !== '›') {
-                    document.querySelectorAll('.pagination button').forEach(b => b.classList.remove('active'));
-                    this.classList.add('active');
-                }
+        // Pagination (anchor links)
+        const pagination = document.querySelector('.pagination');
+        if (pagination) {
+            pagination.addEventListener('click', function(e) {
+                const a = e.target.closest('a');
+                if (!a) return;
+                // Let the browser navigate — optionally update UI immediately
+                pagination.querySelectorAll('a').forEach(el => el.classList.remove('active'));
+                a.classList.add('active');
             });
-        });
+        }
 
         // Filter change listeners
         document.querySelectorAll('.filter-select').forEach(select => {

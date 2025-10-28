@@ -92,64 +92,90 @@ $userId = $_SESSION['user_id'];
                     $this->db = $db;
                 }
 
+                private function tableExists($name) {
+                    $stmt = $this->db->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
+                    $stmt->execute([$name]);
+                    return $stmt->fetchColumn() > 0;
+                }
+
                 public function getTotalLeads() {
+                    if (!$this->tableExists('leads')) {
+                        return ['value' => number_format(0), 'trend' => '+0.0%'];
+                    }
                     $sql = "SELECT 
                             COUNT(*) as total,
                             COUNT(CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL 1 MONTH) THEN 1 END) as last_month
                            FROM leads";
                     $result = $this->db->query($sql)->fetch();
-                    $lastMonthPercentage = $result['last_month'] > 0 
-                        ? round(($result['last_month'] / $result['total']) * 100, 1) 
+                    $total = (int)($result['total'] ?? 0);
+                    $last = (int)($result['last_month'] ?? 0);
+                    $lastMonthPercentage = $last > 0 && $total > 0
+                        ? round(($last / $total) * 100, 1)
                         : 0;
                     return [
-                        'value' => number_format($result['total']),
+                        'value' => number_format($total),
                         'trend' => ($lastMonthPercentage > 0 ? '+' : '') . $lastMonthPercentage . '%'
                     ];
                 }
 
                 public function getQualifiedLeads() {
+                    if (!$this->tableExists('leads')) {
+                        return ['value' => number_format(0), 'trend' => '+0.0%'];
+                    }
                     $sql = "SELECT 
                             COUNT(*) as total,
                             COUNT(CASE WHEN status_updated_at >= DATE_SUB(NOW(), INTERVAL 1 MONTH) THEN 1 END) as last_month
                            FROM leads 
                            WHERE status = 'Qualified'";
                     $result = $this->db->query($sql)->fetch();
-                    $lastMonthPercentage = $result['last_month'] > 0 
-                        ? round(($result['last_month'] / $result['total']) * 100, 1) 
+                    $total = (int)($result['total'] ?? 0);
+                    $last = (int)($result['last_month'] ?? 0);
+                    $lastMonthPercentage = $last > 0 && $total > 0
+                        ? round(($last / $total) * 100, 1)
                         : 0;
                     return [
-                        'value' => number_format($result['total']),
+                        'value' => number_format($total),
                         'trend' => ($lastMonthPercentage > 0 ? '+' : '') . $lastMonthPercentage . '%'
                     ];
                 }
 
                 public function getPipelineValue() {
+                    if (!$this->tableExists('deals')) {
+                        return ['value' => '₱0.00', 'trend' => '+0.0%'];
+                    }
                     $sql = "SELECT 
                             SUM(potential_value) as total,
                             SUM(CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL 1 MONTH) THEN potential_value ELSE 0 END) as last_month
                            FROM deals 
                            WHERE status != 'Lost' AND status != 'Closed'";
                     $result = $this->db->query($sql)->fetch();
-                    $lastMonthPercentage = $result['last_month'] > 0 
-                        ? round(($result['last_month'] / $result['total']) * 100, 1) 
+                    $total = (float)($result['total'] ?? 0);
+                    $last = (float)($result['last_month'] ?? 0);
+                    $lastMonthPercentage = $last > 0 && $total > 0
+                        ? round(($last / $total) * 100, 1)
                         : 0;
                     return [
-                        'value' => '₱' . number_format($result['total'], 2),
+                        'value' => '₱' . number_format($total, 2),
                         'trend' => ($lastMonthPercentage > 0 ? '+' : '') . $lastMonthPercentage . '%'
                     ];
                 }
 
                 public function getConversionRate() {
+                    if (!$this->tableExists('deals')) {
+                        return ['value' => '0.0%', 'trend' => '+0.0%'];
+                    }
                     $sql = "SELECT 
                             (COUNT(CASE WHEN status = 'Won' THEN 1 END) * 100.0 / COUNT(*)) as rate,
                             (COUNT(CASE WHEN status = 'Won' AND status_updated_at >= DATE_SUB(NOW(), INTERVAL 3 MONTH) THEN 1 END) * 100.0 / 
-                             COUNT(CASE WHEN status_updated_at >= DATE_SUB(NOW(), INTERVAL 3 MONTH) THEN 1 END)) as last_quarter
+                             NULLIF(COUNT(CASE WHEN status_updated_at >= DATE_SUB(NOW(), INTERVAL 3 MONTH) THEN 1 END),0)) as last_quarter
                            FROM deals 
                            WHERE status IN ('Won', 'Lost')";
                     $result = $this->db->query($sql)->fetch();
-                    $trend = $result['last_quarter'] - $result['rate'];
+                    $rate = (float)($result['rate'] ?? 0);
+                    $last_quarter = (float)($result['last_quarter'] ?? 0);
+                    $trend = $last_quarter - $rate;
                     return [
-                        'value' => round($result['rate'], 1) . '%',
+                        'value' => round($rate, 1) . '%',
                         'trend' => ($trend > 0 ? '+' : '') . round($trend, 1) . '%'
                     ];
                 }
@@ -222,7 +248,7 @@ $userId = $_SESSION['user_id'];
 
         <div class="tabs-wrapper">
             <div class="tabs">
-                <button class="tab active">Recent Leads</button>
+                <button class="tab active">Recent Customers</button>
                 <button class="tab">Active Deals</button>
                 <button class="tab">Tasks & Follow-ups</button>
                 <button class="tab">Performance</button>
@@ -231,7 +257,7 @@ $userId = $_SESSION['user_id'];
 
         <div class="content-card">
             <div class="card-header">
-                <h2 class="section-title">Recent Leads Overview</h2>
+                <h2 class="section-title">Recent Customers Overview</h2>
                 <div class="card-actions">
                     <button class="icon-btn" title="Filter">🔽</button>
                     <button class="icon-btn" title="Sort">⇅</button>
@@ -255,29 +281,65 @@ $userId = $_SESSION['user_id'];
                         <?php
                         function getRecentLeads($limit = 5, $offset = 0) {
                             global $db;
+                            // If the legacy leads+contacts tables exist, use them
+                            $stmt = $db->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name IN ('leads','contacts')");
+                            $stmt->execute();
+                            $exists = $stmt->fetchColumn() > 0;
+
+                            if ($exists) {
+                                $sql = "SELECT 
+                                        l.LeadID,
+                                        c.FirstName,
+                                        c.LastName,
+                                        c.Email,
+                                        COALESCE(c.CompanyName, '') as CompanyName,
+                                        COALESCE(l.PotentialValue, 0) as PotentialValue,
+                                        COALESCE(l.Priority, 'Normal') as Priority,
+                                        COALESCE(l.Status, 'New') as Status
+                                       FROM leads l
+                                       JOIN contacts c ON l.ContactID = c.ContactID
+                                       ORDER BY l.CreatedAt DESC
+                                       LIMIT ? OFFSET ?";
+
+                                $stmt = $db->prepare($sql);
+                                $stmt->execute([(int)$limit, (int)$offset]);
+                                return $stmt->fetchAll(PDO::FETCH_ASSOC);
+                            }
+
+                            // Fallback: use customers + sales from ERPSCHEMA.sql
                             $sql = "SELECT 
-                                    l.LeadID,
-                                    c.FirstName,
-                                    c.LastName,
-                                    c.Email,
-                                    c.CompanyName,
-                                    l.PotentialValue,
-                                    l.Priority,
-                                    l.Status
-                                   FROM leads l
-                                   JOIN contacts c ON l.ContactID = c.ContactID
-                                   ORDER BY l.CreatedAt DESC
-                                   LIMIT ? OFFSET ?";
-                            
+                                        c.CustomerID AS LeadID,
+                                        c.FirstName,
+                                        c.LastName,
+                                        c.Email,
+                                        '' AS CompanyName,
+                                        COALESCE((SELECT TotalAmount FROM sales s WHERE s.CustomerID = c.CustomerID ORDER BY s.SaleDate DESC LIMIT 1), 0) AS PotentialValue,
+                                        'Normal' AS Priority,
+                                        c.Status AS Status,
+                                        c.CreatedAt AS CreatedAt
+                                    FROM customers c
+                                    ORDER BY c.CreatedAt DESC
+                                    LIMIT ? OFFSET ?";
+
                             $stmt = $db->prepare($sql);
-                            $stmt->execute([$limit, $offset]);
-                            return $stmt->fetchAll();
+                            $stmt->execute([(int)$limit, (int)$offset]);
+                            return $stmt->fetchAll(PDO::FETCH_ASSOC);
                         }
 
                         function getTotalLeadsCount() {
                             global $db;
-                            $sql = "SELECT COUNT(*) as total FROM leads";
-                            return $db->query($sql)->fetch()['total'];
+                            // Prefer counting leads if present, otherwise count customers
+                            $stmt = $db->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'leads'");
+                            $stmt->execute();
+                            $hasLeads = $stmt->fetchColumn() > 0;
+
+                            if ($hasLeads) {
+                                $res = $db->query("SELECT COUNT(*) as total FROM leads")->fetch();
+                                return (int)($res['total'] ?? 0);
+                            }
+
+                            $res = $db->query("SELECT COUNT(*) as total FROM customers")->fetch();
+                            return (int)($res['total'] ?? 0);
                         }
 
                         $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
@@ -353,23 +415,40 @@ $userId = $_SESSION['user_id'];
                     Showing <strong><?php echo $start ?>-<?php echo $end ?></strong> of <strong><?php echo number_format($totalLeads) ?></strong> leads
                 </div>
                 <div class="pagination">
-                    <?php if ($page > 1): ?>
-                        <a href="?page=<?php echo ($page - 1) ?>" class="btn">‹</a>
-                    <?php endif; ?>
-                    
+                    <?php
+                    // compute total pages and show ranges
+                    $totalPages = max(1, (int)ceil($totalLeads / $perPage));
+                    $showStart = $totalLeads ? ($offset + 1) : 0;
+                    $showEnd = min($offset + count($recentLeads), $totalLeads);
+
+                    // preserve GET params
+                    $preserve = $_GET;
+
+                    // previous link
+                    $prevPage = max(1, $page - 1);
+                    $preserve['page'] = $prevPage;
+                    $prevUrl = '?' . http_build_query($preserve);
+                    ?>
+                    <a class="page-btn" href="<?php echo $prevUrl ?>">‹</a>
+
                     <?php
                     $maxPages = 5;
-                    $startPage = max(1, min($page - floor($maxPages/2), $totalPages - $maxPages + 1));
+                    $startPage = max(1, min($page - floor($maxPages/2), max(1, $totalPages - $maxPages + 1)));
                     $endPage = min($startPage + $maxPages - 1, $totalPages);
-                    
                     for ($i = $startPage; $i <= $endPage; $i++):
+                        $preserve['page'] = $i;
+                        $url = '?' . http_build_query($preserve);
+                        $active = ($i == $page) ? 'active' : '';
                     ?>
-                        <a href="?page=<?php echo $i ?>" class="btn <?php echo ($i == $page ? 'active' : '') ?>"><?php echo $i ?></a>
+                        <a href="<?php echo $url ?>" class="page-btn <?php echo $active ?>"><?php echo $i ?></a>
                     <?php endfor; ?>
-                    
-                    <?php if ($page < $totalPages): ?>
-                        <a href="?page=<?php echo ($page + 1) ?>" class="btn">›</a>
-                    <?php endif; ?>
+
+                    <?php
+                    $nextPage = min($totalPages, $page + 1);
+                    $preserve['page'] = $nextPage;
+                    $nextUrl = '?' . http_build_query($preserve);
+                    ?>
+                    <a class="page-btn" href="<?php echo $nextUrl ?>">›</a>
                 </div>
             </div>
             <?php
