@@ -1,4 +1,8 @@
 <?php
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
+
 if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
@@ -510,6 +514,84 @@ if (isset($_POST['action']) && $_POST['action'] === 'generate_report') {
         header('Location: ' . $_SERVER['HTTP_REFERER']);
         exit();
     }
+}
+
+// Handle get lead data
+if (isset($_GET['action']) && $_GET['action'] === 'get_lead_details') {
+    header('Content-Type: application/json');
+    $response = ['success' => false];
+    
+    try {
+        $leadId = $_GET['lead_id'] ?? 0;
+        
+        // Since you're using customers table as leads
+        $stmt = $pdo->prepare("SELECT * FROM customers WHERE CustomerID = ?");
+        $stmt->execute([$leadId]);
+        $lead = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($lead) {
+            $response = $lead;
+        }
+    } catch (Exception $e) {
+        $response['error'] = $e->getMessage();
+    }
+    
+    echo json_encode($response);
+    exit();
+}
+
+// Handle get deal data
+if (isset($_GET['action']) && $_GET['action'] === 'get_deal_details') {
+    header('Content-Type: application/json');
+    $response = ['success' => false];
+    
+    try {
+        $dealId = $_GET['deal_id'] ?? 0;
+        
+        // Add your deals table query here
+        // For now, returning dummy data
+        $response = [
+            'DealID' => $dealId,
+            'DealName' => 'Sample Deal',
+            'DealValue' => 10000,
+            'Stage' => 'Prospecting',
+            'Probability' => 50,
+            'CloseDate' => date('Y-m-d'),
+            'Notes' => ''
+        ];
+    } catch (Exception $e) {
+        $response['error'] = $e->getMessage();
+    }
+    
+    echo json_encode($response);
+    exit();
+}
+
+// Handle get task data
+if (isset($_GET['action']) && $_GET['action'] === 'get_task_details') {
+    header('Content-Type: application/json');
+    $response = ['success' => false];
+    
+    try {
+        $taskId = $_GET['task_id'] ?? 0;
+        
+        // Add your tasks table query here
+        // For now, returning dummy data
+        $response = [
+            'TaskID' => $taskId,
+            'Title' => 'Sample Task',
+            'Description' => '',
+            'DueDate' => date('Y-m-d'),
+            'Priority' => 'Medium',
+            'Status' => 'Pending',
+            'AssignedTo' => ''
+        ];
+    } catch (Exception $e) {
+        $response['error'] = $e->getMessage();
+    }
+    
+    echo json_encode($response);
+    exit();
 }
 
 // ========================================

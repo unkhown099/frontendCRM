@@ -2,7 +2,7 @@
 session_start();
 
 // Include DB config and get PDO
-require_once('../../api/crm.php');
+require_once('../api/crm.php');
 
 try {
     $pdo = Database::getInstance()->getConnection();

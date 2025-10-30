@@ -2,7 +2,7 @@
 session_start();
 
 // Backend: connect to Database singleton
-require_once(__DIR__ . '/../../config/database.php');
+require_once(__DIR__ . '../../config/database.php');
 try {
     $pdo = Database::getInstance()->getConnection();
 } catch (Exception $e) {

@@ -1,6 +1,6 @@
 <?php
 // Include the unified backend
-require_once('../../api/crm.php');
+require_once('../api/crm.php');
 
 // Prepare data holders
 $totalTickets = 0;
@@ -1031,6 +1031,9 @@ if ($userId) {
         let currentPage = 1;
         const itemsPerPage = 50;
 
+        // Get the correct API path
+        const API_PATH = '../api/crm.php'; // Adjust this based on your file structure
+
         function updateCustomerInfo() {
             const customerSelect = document.getElementById('customerSelect');
             const selectedOption = customerSelect.options[customerSelect.selectedIndex];
@@ -1043,16 +1046,33 @@ if ($userId) {
 
         async function viewTicket(ticketId) {
             try {
-                const response = await fetch(`crm.php?action=get_ticket_details&ticket_id=${encodeURIComponent(ticketId)}`);
-                const data = await response.json();
+                const response = await fetch(`${API_PATH}?action=get_ticket_details&ticket_id=${encodeURIComponent(ticketId)}`);
+
+                // Check if response is ok
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                // Get the response as text first to check what we're receiving
+                const text = await response.text();
+
+                // Try to parse as JSON
+                let data;
+                try {
+                    data = JSON.parse(text);
+                } catch (e) {
+                    console.error('Response is not JSON:', text.substring(0, 200)); // Log first 200 chars
+                    throw new Error('Server returned invalid JSON. Check browser console for details.');
+                }
 
                 if (data.success) {
                     displayTicketDetails(data.ticket);
                     openViewModal();
                 } else {
-                    showError('Error loading ticket: ' + data.message);
+                    showError('Error loading ticket: ' + (data.message || 'Unknown error'));
                 }
             } catch (error) {
+                console.error('Error in viewTicket:', error);
                 showError('Error loading ticket details: ' + error.message);
             }
         }
@@ -1112,7 +1132,7 @@ if ($userId) {
         }
 
         function startRealtimeUpdates() {
-            realtimeInterval = setInterval(checkForUpdates, 5000);
+            realtimeInterval = setInterval(checkForUpdates, 30000); // Changed to 30 seconds to reduce load
             document.getElementById('realtimeIndicator').style.display = 'flex';
         }
 
@@ -1126,19 +1146,32 @@ if ($userId) {
 
         async function checkForUpdates() {
             try {
-                const response = await fetch(`crm.php?action=get_ticket_updates&last_update=${encodeURIComponent(lastUpdateTime)}`);
-                const data = await response.json();
+                const response = await fetch(`${API_PATH}?action=get_ticket_updates&last_update=${encodeURIComponent(lastUpdateTime)}`);
+
+                if (!response.ok) {
+                    console.error('Update check failed:', response.status);
+                    return;
+                }
+
+                const text = await response.text();
+                let data;
+
+                try {
+                    data = JSON.parse(text);
+                } catch (e) {
+                    console.error('Invalid JSON in update check:', text.substring(0, 200));
+                    return;
+                }
 
                 if (data.updated) {
-                    lastUpdateTime = '<?php echo date('Y-m-d H:i:s'); ?>';
+                    lastUpdateTime = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
                     if (data.stats) {
                         updateStats(data.stats);
                     }
 
-                    if (data.tickets.length > 0) {
+                    if (data.tickets && data.tickets.length > 0) {
                         showUpdateNotification(data.tickets.length);
-                        refreshTickets();
                     }
                 }
             } catch (error) {
@@ -1162,17 +1195,19 @@ if ($userId) {
             const notification = document.createElement('div');
             notification.className = 'update-notification';
             notification.innerHTML = `
-                <div style="padding: 12px; background: #10b981; color: white; border-radius: 6px; margin-bottom: 10px; font-size: 14px;">
-                    🔄 ${count} ticket${count > 1 ? 's' : ''} updated. <a href="javascript:void(0)" onclick="refreshTickets()" style="color: white; text-decoration: underline;">Refresh</a>
-                </div>
-            `;
+            <div style="padding: 12px; background: #10b981; color: white; border-radius: 6px; margin-bottom: 10px; font-size: 14px;">
+                🔄 ${count} ticket${count > 1 ? 's' : ''} updated. <a href="javascript:void(0)" onclick="refreshTickets()" style="color: white; text-decoration: underline;">Refresh</a>
+            </div>
+        `;
 
             const container = document.querySelector('.container');
-            container.insertBefore(notification, container.firstChild);
+            if (container) {
+                container.insertBefore(notification, container.firstChild);
 
-            setTimeout(() => {
-                notification.remove();
-            }, 5000);
+                setTimeout(() => {
+                    notification.remove();
+                }, 5000);
+            }
         }
 
         async function applyFilters() {
@@ -1192,8 +1227,21 @@ if ($userId) {
                     ...filters
                 });
 
-                const response = await fetch(`crm.php?${params}`);
-                const data = await response.json();
+                const response = await fetch(`${API_PATH}?${params.toString()}`);
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const text = await response.text();
+                let data;
+
+                try {
+                    data = JSON.parse(text);
+                } catch (e) {
+                    console.error('Response is not JSON:', text.substring(0, 500)); // Log more chars for debugging
+                    throw new Error('Server returned invalid response. Please check if you are logged in.');
+                }
 
                 if (!data.error) {
                     updateTicketsTable(data.tickets, data.total_count);
@@ -1201,6 +1249,7 @@ if ($userId) {
                     showError('Error applying filters: ' + data.error);
                 }
             } catch (error) {
+                console.error('Filter error:', error);
                 showError('Error applying filters: ' + error.message);
             }
         }
@@ -1211,6 +1260,11 @@ if ($userId) {
             const totalTicketsCount = document.getElementById('totalTicketsCount');
             const showingRange = document.getElementById('showingRange');
 
+            if (!tbody) {
+                console.error('Table body not found');
+                return;
+            }
+
             ticketCount.textContent = totalCount;
             totalTicketsCount.textContent = totalCount;
             const showingEnd = Math.min(itemsPerPage, tickets.length);
@@ -1218,44 +1272,49 @@ if ($userId) {
 
             tbody.innerHTML = '';
 
+            if (tickets.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="11" style="text-align:center; padding: 40px;">No tickets found matching your filters.</td></tr>';
+                return;
+            }
+
             tickets.forEach(ticket => {
                 const row = document.createElement('tr');
                 row.innerHTML = `
-                    <td><input type="checkbox"></td>
-                    <td><span class="contact-id">${ticket.id}</span></td>
-                    <td>
-                        <div class="contact-name-cell">
-                            <div class="contact-avatar">${ticket.customer_initials}</div>
-                            <div class="contact-name-info">
-                                <div class="contact-name-primary">${ticket.customer}</div>
-                            </div>
+                <td><input type="checkbox"></td>
+                <td><span class="contact-id">${ticket.id}</span></td>
+                <td>
+                    <div class="contact-name-cell">
+                        <div class="contact-avatar">${ticket.customer_initials}</div>
+                        <div class="contact-name-info">
+                            <div class="contact-name-primary">${ticket.customer}</div>
                         </div>
-                    </td>
-                    <td>
-                        <div class="ticket-subject">
-                            <div class="ticket-subject-title">${ticket.subject}</div>
-                            <div class="ticket-subject-desc">${ticket.description}</div>
-                            ${ticket.sale_ref !== '-' ? `<div class="ticket-sale-ref">🔗 ${ticket.sale_ref}</div>` : ''}
-                        </div>
-                    </td>
-                    <td><span class="category-badge category-${ticket.category.toLowerCase().replace(' ', '-')}">${ticket.category}</span></td>
-                    <td><span class="priority-badge priority-${ticket.priority.toLowerCase()}">${ticket.priority}</span></td>
-                    <td><span class="status-badge ticket-status-${ticket.status.toLowerCase().replace(' ', '-')}">${ticket.status.toUpperCase()}</span></td>
-                    <td>
-                        <div class="contact-name-cell">
-                            <div class="contact-avatar" style="width: 32px; height: 32px; font-size: 12px;">${ticket.assigned_initials}</div>
-                            <span>${ticket.assigned}</span>
-                        </div>
-                    </td>
-                    <td>${ticket.created}</td>
-                    <td>${ticket.updated}</td>
-                    <td>
-                        <div class="action-buttons">
-                            <button class="action-btn" onclick="viewTicket('${ticket.id}')">View</button>
-                            <button class="action-btn" onclick="updateTicket('${ticket.id}')">Update</button>
-                        </div>
-                    </td>
-                `;
+                    </div>
+                </td>
+                <td>
+                    <div class="ticket-subject">
+                        <div class="ticket-subject-title">${ticket.subject}</div>
+                        <div class="ticket-subject-desc">${ticket.description}</div>
+                        ${ticket.sale_ref !== '-' ? `<div class="ticket-sale-ref">🔗 ${ticket.sale_ref}</div>` : ''}
+                    </div>
+                </td>
+                <td><span class="category-badge category-${ticket.category.toLowerCase().replace(' ', '-')}">${ticket.category}</span></td>
+                <td><span class="priority-badge priority-${ticket.priority.toLowerCase()}">${ticket.priority}</span></td>
+                <td><span class="status-badge ticket-status-${ticket.status.toLowerCase().replace(' ', '-')}">${ticket.status.toUpperCase()}</span></td>
+                <td>
+                    <div class="contact-name-cell">
+                        <div class="contact-avatar" style="width: 32px; height: 32px; font-size: 12px;">${ticket.assigned_initials}</div>
+                        <span>${ticket.assigned}</span>
+                    </div>
+                </td>
+                <td>${ticket.created}</td>
+                <td>${ticket.updated}</td>
+                <td>
+                    <div class="action-buttons">
+                        <button class="action-btn" onclick="viewTicket('${ticket.id}')">View</button>
+                        <button class="action-btn" onclick="updateTicket('${ticket.id}')">Update</button>
+                    </div>
+                </td>
+            `;
                 tbody.appendChild(row);
             });
         }
@@ -1272,7 +1331,7 @@ if ($userId) {
 
         function refreshTickets() {
             applyFilters();
-            lastUpdateTime = '<?php echo date('Y-m-d H:i:s'); ?>';
+            lastUpdateTime = new Date().toISOString().slice(0, 19).replace('T', ' ');
         }
 
         function generateReports() {
@@ -1283,7 +1342,7 @@ if ($userId) {
 
         function exportTickets() {
             const filters = currentFilters;
-            const exportUrl = `crm.php?action=export_tickets&status=${filters.status}&priority=${filters.priority}&category=${filters.category}&date_range=${filters.date_range}&search=${filters.search}`;
+            const exportUrl = `${API_PATH}?action=export_tickets&status=${filters.status}&priority=${filters.priority}&category=${filters.category}&date_range=${filters.date_range}&search=${encodeURIComponent(filters.search)}`;
             window.location.href = exportUrl;
         }
 
@@ -1295,34 +1354,38 @@ if ($userId) {
             const errorDiv = document.createElement('div');
             errorDiv.className = 'update-notification';
             errorDiv.innerHTML = `
-                <div style="padding: 12px; background: #ef4444; color: white; border-radius: 6px; margin-bottom: 10px; font-size: 14px;">
-                    ❌ ${message}
-                </div>
-            `;
+            <div style="padding: 12px; background: #ef4444; color: white; border-radius: 6px; margin-bottom: 10px; font-size: 14px;">
+                ❌ ${message}
+            </div>
+        `;
 
             const container = document.querySelector('.container');
-            container.insertBefore(errorDiv, container.firstChild);
+            if (container) {
+                container.insertBefore(errorDiv, container.firstChild);
 
-            setTimeout(() => {
-                errorDiv.remove();
-            }, 5000);
+                setTimeout(() => {
+                    errorDiv.remove();
+                }, 5000);
+            }
         }
 
         function showSuccess(message) {
             const successDiv = document.createElement('div');
             successDiv.className = 'update-notification';
             successDiv.innerHTML = `
-                <div style="padding: 12px; background: #10b981; color: white; border-radius: 6px; margin-bottom: 10px; font-size: 14px;">
-                    ✅ ${message}
-                </div>
-            `;
+            <div style="padding: 12px; background: #10b981; color: white; border-radius: 6px; margin-bottom: 10px; font-size: 14px;">
+                ✅ ${message}
+            </div>
+        `;
 
             const container = document.querySelector('.container');
-            container.insertBefore(successDiv, container.firstChild);
+            if (container) {
+                container.insertBefore(successDiv, container.firstChild);
 
-            setTimeout(() => {
-                successDiv.remove();
-            }, 5000);
+                setTimeout(() => {
+                    successDiv.remove();
+                }, 5000);
+            }
         }
 
         function openTicketModal() {
@@ -1337,7 +1400,7 @@ if ($userId) {
         }
 
         function openUpdateModal(ticketId) {
-            document.getElementById('updateTicketId').value = ticketId;
+            document.getElementById('updateTicketId').value = ticketId.replace('#TKT-', '');
             document.getElementById('updateTicketModal').classList.add('active');
         }
 
@@ -1362,22 +1425,47 @@ if ($userId) {
             formData.append('action', 'create_ticket');
 
             try {
-                const response = await fetch('crm.php', {
+                const response = await fetch(API_PATH, {
                     method: 'POST',
                     body: formData
                 });
 
-                const result = await response.json();
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const text = await response.text();
+
+                // LOG THE FULL RESPONSE FOR DEBUGGING
+                console.log('=== SERVER RESPONSE ===');
+                console.log('Response length:', text.length);
+                console.log('First 1000 characters:', text.substring(0, 1000));
+                console.log('======================');
+
+                let result;
+
+                try {
+                    result = JSON.parse(text);
+                } catch (e) {
+                    console.error('JSON Parse Error:', e);
+                    console.error('Full response:', text);
+
+                    // Show more helpful error with response preview
+                    const preview = text.substring(0, 200).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    showError(`Server returned invalid response. Check console for details. Preview: ${preview}`);
+                    throw new Error('Server returned invalid response');
+                }
 
                 if (result.success) {
                     showSuccess(result.message);
                     closeTicketModal();
                     refreshTickets();
-                    lastUpdateTime = '<?php echo date('Y-m-d H:i:s'); ?>';
+                    lastUpdateTime = new Date().toISOString().slice(0, 19).replace('T', ' ');
                 } else {
-                    showError('Error: ' + result.message);
+                    showError('Error: ' + (result.message || 'Unknown error'));
                 }
             } catch (error) {
+                console.error('Save ticket error:', error);
                 showError('Error creating ticket: ' + error.message);
             } finally {
                 submitBtn.classList.remove('btn-loading');
@@ -1395,22 +1483,35 @@ if ($userId) {
             submitBtn.disabled = true;
 
             try {
-                const response = await fetch('crm.php', {
+                const response = await fetch(API_PATH, {
                     method: 'POST',
                     body: formData
                 });
 
-                const result = await response.json();
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const text = await response.text();
+                let result;
+
+                try {
+                    result = JSON.parse(text);
+                } catch (e) {
+                    console.error('Response is not JSON:', text.substring(0, 500));
+                    throw new Error('Server returned invalid response');
+                }
 
                 if (result.success) {
                     showSuccess(result.message);
                     closeUpdateModal();
                     refreshTickets();
-                    lastUpdateTime = '<?php echo date('Y-m-d H:i:s'); ?>';
+                    lastUpdateTime = new Date().toISOString().slice(0, 19).replace('T', ' ');
                 } else {
-                    showError('Error: ' + result.message);
+                    showError('Error: ' + (result.message || 'Unknown error'));
                 }
             } catch (error) {
+                console.error('Update ticket error:', error);
                 showError('Error updating ticket: ' + error.message);
             } finally {
                 submitBtn.classList.remove('btn-loading');
@@ -1424,38 +1525,63 @@ if ($userId) {
 
         function changePage(direction) {
             console.log('Changing page:', direction);
+            // Implement pagination logic here if needed
         }
 
         document.addEventListener('DOMContentLoaded', function() {
-            document.getElementById('statusFilter').addEventListener('change', applyFilters);
-            document.getElementById('priorityFilter').addEventListener('change', applyFilters);
-            document.getElementById('categoryFilter').addEventListener('change', applyFilters);
-            document.getElementById('dateFilter').addEventListener('change', applyFilters);
-            document.getElementById('globalSearch').addEventListener('input', applyFilters);
+            // Add event listeners
+            const statusFilter = document.getElementById('statusFilter');
+            const priorityFilter = document.getElementById('priorityFilter');
+            const categoryFilter = document.getElementById('categoryFilter');
+            const dateFilter = document.getElementById('dateFilter');
+            const globalSearch = document.getElementById('globalSearch');
 
-            document.getElementById('createTicketBtn').addEventListener('click', saveTicket);
-            document.getElementById('updateTicketBtn').addEventListener('click', submitTicketUpdate);
+            if (statusFilter) statusFilter.addEventListener('change', applyFilters);
+            if (priorityFilter) priorityFilter.addEventListener('change', applyFilters);
+            if (categoryFilter) categoryFilter.addEventListener('change', applyFilters);
+            if (dateFilter) dateFilter.addEventListener('change', applyFilters);
+            if (globalSearch) {
+                // Debounce search input
+                let searchTimeout;
+                globalSearch.addEventListener('input', function() {
+                    clearTimeout(searchTimeout);
+                    searchTimeout = setTimeout(applyFilters, 500);
+                });
+            }
 
+            const createBtn = document.getElementById('createTicketBtn');
+            const updateBtn = document.getElementById('updateTicketBtn');
+
+            if (createBtn) createBtn.addEventListener('click', saveTicket);
+            if (updateBtn) updateBtn.addEventListener('click', submitTicketUpdate);
+
+            // Start real-time updates
             startRealtimeUpdates();
 
-            document.getElementById('ticketModal').addEventListener('click', function(e) {
-                if (e.target === this) {
-                    closeTicketModal();
-                }
-            });
+            // Modal click handlers
+            const ticketModal = document.getElementById('ticketModal');
+            const updateModal = document.getElementById('updateTicketModal');
+            const viewModal = document.getElementById('viewTicketModal');
 
-            document.getElementById('updateTicketModal').addEventListener('click', function(e) {
-                if (e.target === this) {
-                    closeUpdateModal();
-                }
-            });
+            if (ticketModal) {
+                ticketModal.addEventListener('click', function(e) {
+                    if (e.target === this) closeTicketModal();
+                });
+            }
 
-            document.getElementById('viewTicketModal').addEventListener('click', function(e) {
-                if (e.target === this) {
-                    closeViewModal();
-                }
-            });
+            if (updateModal) {
+                updateModal.addEventListener('click', function(e) {
+                    if (e.target === this) closeUpdateModal();
+                });
+            }
 
+            if (viewModal) {
+                viewModal.addEventListener('click', function(e) {
+                    if (e.target === this) closeViewModal();
+                });
+            }
+
+            // Select all checkbox
             const selectAll = document.getElementById('selectAll');
             if (selectAll) {
                 selectAll.addEventListener('change', function() {
@@ -1465,6 +1591,8 @@ if ($userId) {
                     });
                 });
             }
+
+            console.log('Customer Support page initialized successfully');
         });
     </script>
 </body>
