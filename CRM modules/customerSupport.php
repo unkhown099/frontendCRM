@@ -1,3 +1,681 @@
+<?php
+session_start();
+
+// Backend: connect to Database singleton
+require_once(__DIR__ . '/../config/database.php');
+try {
+    $pdo = Database::getInstance()->getConnection();
+} catch (Exception $e) {
+    die('Database connection error: ' . $e->getMessage());
+}
+
+// Simple auth redirect
+if (!isset($_SESSION['user_id'])) {
+    header('Location: ../login.php');
+    exit();
+}
+
+// Handle view ticket request
+if (isset($_GET['action']) && $_GET['action'] === 'get_ticket_details') {
+    header('Content-Type: application/json');
+    $response = ['success' => false, 'message' => ''];
+    
+    try {
+        $ticket_id = str_replace('#TKT-', '', $_GET['ticket_id'] ?? '');
+        
+        $possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
+        $ticketTable = null;
+        foreach ($possibleTicketTables as $tbl) {
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
+            $stmt->execute([$tbl]);
+            if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
+        }
+        
+        if ($ticketTable) {
+            $stmt = $pdo->prepare("
+                SELECT 
+                    t.*,
+                    c.FirstName, c.LastName, c.Email, c.Phone, c.Address,
+                    u.FirstName AS agent_first, u.LastName AS agent_last, u.Email AS agent_email,
+                    s.StoreName, s.Location AS store_location
+                FROM `{$ticketTable}` t
+                LEFT JOIN customers c ON t.CustomerID = c.CustomerID
+                LEFT JOIN users u ON t.AssignedTo = u.UserID
+                LEFT JOIN stores s ON t.StoreID = s.StoreID
+                WHERE t.TicketID = ?
+            ");
+            $stmt->execute([$ticket_id]);
+            $ticket = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            if ($ticket) {
+                $response['success'] = true;
+                $response['ticket'] = [
+                    'id' => '#TKT-' . $ticket['TicketID'],
+                    'customer_name' => trim($ticket['FirstName'] . ' ' . $ticket['LastName']),
+                    'customer_email' => $ticket['Email'],
+                    'customer_phone' => $ticket['Phone'],
+                    'customer_address' => $ticket['Address'],
+                    'subject' => $ticket['Subject'],
+                    'description' => $ticket['Description'],
+                    'category' => $ticket['Category'],
+                    'priority' => $ticket['Priority'],
+                    'status' => $ticket['Status'],
+                    'assigned_to' => trim($ticket['agent_first'] . ' ' . $ticket['agent_last']),
+                    'assigned_email' => $ticket['agent_email'],
+                    'sale_ref' => $ticket['SaleRef'],
+                    'store_name' => $ticket['StoreName'],
+                    'store_location' => $ticket['store_location'],
+                    'contact_method' => $ticket['ContactMethod'],
+                    'due_date' => $ticket['DueDate'] ? date('M d, Y', strtotime($ticket['DueDate'])) : 'Not set',
+                    'tags' => $ticket['Tags'],
+                    'internal_notes' => $ticket['InternalNotes'],
+                    'created_at' => date('M d, Y H:i', strtotime($ticket['CreatedAt'])),
+                    'updated_at' => date('M d, Y H:i', strtotime($ticket['UpdatedAt'])),
+                    'first_response_at' => $ticket['FirstResponseAt'] ? date('M d, Y H:i', strtotime($ticket['FirstResponseAt'])) : 'Not yet',
+                    'feedback_score' => $ticket['FeedbackScore'] ? $ticket['FeedbackScore'] . '/5' : 'No feedback'
+                ];
+            } else {
+                $response['message'] = 'Ticket not found';
+            }
+        }
+    } catch (Exception $e) {
+        $response['message'] = 'Error fetching ticket details: ' . $e->getMessage();
+    }
+    
+    echo json_encode($response);
+    exit();
+}
+
+// Handle create ticket request
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'create_ticket') {
+    header('Content-Type: application/json');
+    $response = ['success' => false, 'message' => ''];
+    
+    try {
+        $possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
+        $ticketTable = null;
+        foreach ($possibleTicketTables as $tbl) {
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
+            $stmt->execute([$tbl]);
+            if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
+        }
+        
+        if (!$ticketTable) {
+            $ticketTable = 'support_tickets';
+            $createTableSQL = "
+                CREATE TABLE IF NOT EXISTS `support_tickets` (
+                    TicketID INT AUTO_INCREMENT PRIMARY KEY,
+                    CustomerID INT NOT NULL,
+                    Category VARCHAR(100) NOT NULL,
+                    Priority VARCHAR(50) NOT NULL,
+                    Subject VARCHAR(255) NOT NULL,
+                    Description TEXT NOT NULL,
+                    SaleRef VARCHAR(100),
+                    AssignedTo INT NOT NULL,
+                    Status VARCHAR(50) DEFAULT 'Open',
+                    CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    FirstResponseAt TIMESTAMP NULL,
+                    FeedbackScore INT NULL,
+                    InternalNotes TEXT,
+                    StoreID INT NULL,
+                    ContactMethod VARCHAR(50) DEFAULT 'Email',
+                    DueDate DATE NULL,
+                    Tags VARCHAR(255),
+                    FOREIGN KEY (CustomerID) REFERENCES customers(CustomerID),
+                    FOREIGN KEY (AssignedTo) REFERENCES users(UserID)
+                )
+            ";
+            $pdo->exec($createTableSQL);
+        }
+        
+        $customer_id = $_POST['customer_id'] ?? '';
+        $category = $_POST['category'] ?? '';
+        $priority = $_POST['priority'] ?? '';
+        $subject = trim($_POST['subject'] ?? '');
+        $description = trim($_POST['description'] ?? '');
+        $sale_ref = trim($_POST['sale_ref'] ?? '');
+        $assigned_to = $_POST['assigned_to'] ?? '';
+        $notes = trim($_POST['notes'] ?? '');
+        $store_id = $_POST['store_id'] ?? null;
+        $contact_method = $_POST['contact_method'] ?? 'Email';
+        $due_date = $_POST['due_date'] ?? null;
+        $tags = trim($_POST['tags'] ?? '');
+        
+        if (empty($customer_id) || empty($category) || empty($priority) || empty($subject) || empty($description) || empty($assigned_to)) {
+            $response['message'] = 'All required fields must be filled';
+            echo json_encode($response);
+            exit();
+        }
+        
+        $categoryMap = [
+            'Product Issue' => 'Product Issue',
+            'Order Issue' => 'Order Issue',
+            'Refund Request' => 'Refund Request',
+            'Billing Issue' => 'Billing Issue',
+            'Technical Support' => 'Technical Support',
+            'Account Issue' => 'Account Issue',
+            'Shipping Issue' => 'Shipping Issue',
+            'Complaint' => 'Complaint',
+            'Inquiry' => 'Inquiry',
+            'Feature Request' => 'Feature Request'
+        ];
+        
+        $category = $categoryMap[$category] ?? $category;
+        
+        $priorityMap = [
+            'Critical' => 'Critical',
+            'High' => 'High',
+            'Medium' => 'Medium',
+            'Low' => 'Low'
+        ];
+        
+        $priority = $priorityMap[$priority] ?? $priority;
+        
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM customers WHERE CustomerID = ?");
+        $stmt->execute([$customer_id]);
+        if ($stmt->fetchColumn() == 0) {
+            $response['message'] = 'Selected customer does not exist';
+            echo json_encode($response);
+            exit();
+        }
+        
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM users WHERE UserID = ?");
+        $stmt->execute([$assigned_to]);
+        if ($stmt->fetchColumn() == 0) {
+            $response['message'] = 'Selected agent does not exist';
+            echo json_encode($response);
+            exit();
+        }
+        
+        if (!empty($sale_ref) && !str_contains($sale_ref, '#')) {
+            $sale_ref = '#SALE-' . $sale_ref;
+        }
+        
+        if (!empty($due_date)) {
+            $due_date = date('Y-m-d', strtotime($due_date));
+        } else {
+            $due_date = null;
+        }
+        
+        $stmt = $pdo->prepare("
+            INSERT INTO `{$ticketTable}` 
+            (CustomerID, Category, Priority, Subject, Description, SaleRef, AssignedTo, Status, InternalNotes, StoreID, ContactMethod, DueDate, Tags)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'Open', ?, ?, ?, ?, ?)
+        ");
+        
+        $success = $stmt->execute([
+            $customer_id, $category, $priority, $subject, $description, $sale_ref, $assigned_to, 
+            $notes, $store_id, $contact_method, $due_date, $tags
+        ]);
+        
+        if ($success) {
+            $ticketId = $pdo->lastInsertId();
+            $response['success'] = true;
+            $response['message'] = 'Ticket created successfully!';
+            $response['ticket_id'] = $ticketId;
+        } else {
+            $response['message'] = 'Failed to create ticket in database';
+        }
+    } catch (Exception $e) {
+        $response['message'] = 'Error creating ticket: ' . $e->getMessage();
+    }
+    
+    echo json_encode($response);
+    exit();
+}
+
+// Handle AJAX requests for real-time updates
+if (isset($_GET['action']) && $_GET['action'] === 'get_ticket_updates') {
+    header('Content-Type: application/json');
+    
+    $lastUpdateTime = $_GET['last_update'] ?? '1970-01-01 00:00:00';
+    $response = ['updated' => false, 'tickets' => [], 'stats' => []];
+    
+    try {
+        $possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
+        $ticketTable = null;
+        foreach ($possibleTicketTables as $tbl) {
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
+            $stmt->execute([$tbl]);
+            if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
+        }
+        
+        if ($ticketTable) {
+            $stmt = $pdo->prepare("
+                SELECT t.TicketID AS id, t.CustomerID, t.Subject AS subject, t.Description AS description, 
+                       t.Category AS category, t.Priority AS priority, t.Status AS status, 
+                       t.AssignedTo AS assigned_id, t.CreatedAt AS created, t.UpdatedAt AS updated, 
+                       t.SaleRef AS sale_ref, t.ContactMethod, t.DueDate, t.Tags,
+                       c.FirstName, c.LastName, 
+                       u.FirstName AS agent_first, u.LastName AS agent_last
+                FROM `{$ticketTable}` t
+                LEFT JOIN customers c ON t.CustomerID = c.CustomerID
+                LEFT JOIN users u ON t.AssignedTo = u.UserID
+                WHERE t.UpdatedAt > ? OR t.CreatedAt > ?
+                ORDER BY t.CreatedAt DESC
+                LIMIT 50
+            ");
+            $stmt->execute([$lastUpdateTime, $lastUpdateTime]);
+            $updatedTickets = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            
+            if (count($updatedTickets) > 0) {
+                $response['updated'] = true;
+                foreach ($updatedTickets as $r) {
+                    $custName = trim(($r['FirstName'] ?? '') . ' ' . ($r['LastName'] ?? '')) ?: 'Customer';
+                    $agentName = trim(($r['agent_first'] ?? '') . ' ' . ($r['agent_last'] ?? '')) ?: '—';
+                    $response['tickets'][] = [
+                        'id' => '#TKT-' . ($r['id'] ?? '0'),
+                        'customer' => $custName,
+                        'customer_initials' => getInitials($custName),
+                        'subject' => $r['subject'] ?? '',
+                        'description' => $r['description'] ?? '',
+                        'category' => $r['category'] ?? 'Inquiry',
+                        'priority' => $r['priority'] ?? 'Medium',
+                        'status' => $r['status'] ?? 'Open',
+                        'assigned' => $agentName,
+                        'assigned_initials' => getInitials($agentName),
+                        'created' => isset($r['created']) ? date('M d, Y H:i', strtotime($r['created'])) : '',
+                        'updated' => isset($r['updated']) ? date('M d, Y H:i', strtotime($r['updated'])) : '',
+                        'sale_ref' => $r['sale_ref'] ?? '-',
+                        'contact_method' => $r['ContactMethod'] ?? 'Email',
+                        'due_date' => $r['DueDate'] ? date('M d, Y', strtotime($r['DueDate'])) : '',
+                        'tags' => $r['Tags'] ?? ''
+                    ];
+                }
+                
+                $stats = getTicketStats($pdo, $ticketTable);
+                $response['stats'] = $stats;
+            }
+        }
+    } catch (Exception $e) {
+        $response['error'] = $e->getMessage();
+    }
+    
+    echo json_encode($response);
+    exit();
+}
+
+// Handle filter requests
+if (isset($_GET['action']) && $_GET['action'] === 'filter_tickets') {
+    header('Content-Type: application/json');
+    
+    $filters = [
+        'status' => $_GET['status'] ?? '',
+        'priority' => $_GET['priority'] ?? '',
+        'category' => $_GET['category'] ?? '',
+        'date_range' => $_GET['date_range'] ?? '',
+        'search' => $_GET['search'] ?? ''
+    ];
+    
+    $response = ['tickets' => [], 'total_count' => 0];
+    
+    try {
+        $possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
+        $ticketTable = null;
+        foreach ($possibleTicketTables as $tbl) {
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
+            $stmt->execute([$tbl]);
+            if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
+        }
+        
+        if ($ticketTable) {
+            $filteredTickets = getFilteredTickets($pdo, $ticketTable, $filters);
+            $response['tickets'] = $filteredTickets['tickets'];
+            $response['total_count'] = $filteredTickets['total_count'];
+        }
+    } catch (Exception $e) {
+        $response['error'] = $e->getMessage();
+    }
+    
+    echo json_encode($response);
+    exit();
+}
+
+// Handle update ticket status
+if ($_POST['action'] ?? '' === 'update_ticket_status') {
+    header('Content-Type: application/json');
+    $response = ['success' => false, 'message' => ''];
+    
+    try {
+        $ticket_id = str_replace('#TKT-', '', $_POST['ticket_id'] ?? '');
+        $status = $_POST['status'] ?? '';
+        $feedback_score = $_POST['feedback_score'] ?? null;
+        
+        $possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
+        $ticketTable = null;
+        foreach ($possibleTicketTables as $tbl) {
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
+            $stmt->execute([$tbl]);
+            if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
+        }
+        
+        if ($ticketTable) {
+            $stmt = $pdo->prepare("SELECT Status, FirstResponseAt FROM `{$ticketTable}` WHERE TicketID = ?");
+            $stmt->execute([$ticket_id]);
+            $ticket = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            $updates = ['Status = ?', 'UpdatedAt = NOW()'];
+            $params = [$status];
+            
+            if ($ticket && $ticket['Status'] === 'Open' && $status !== 'Open' && !$ticket['FirstResponseAt']) {
+                $updates[] = 'FirstResponseAt = NOW()';
+            }
+            
+            if ($feedback_score !== null && $feedback_score !== '') {
+                $updates[] = 'FeedbackScore = ?';
+                $params[] = $feedback_score;
+            }
+            
+            $params[] = $ticket_id;
+            
+            $sql = "UPDATE `{$ticketTable}` SET " . implode(', ', $updates) . " WHERE TicketID = ?";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+            
+            $response['success'] = true;
+            $response['message'] = 'Ticket updated successfully!';
+        }
+    } catch (Exception $e) {
+        $response['message'] = 'Error updating ticket: ' . $e->getMessage();
+    }
+    
+    echo json_encode($response);
+    exit();
+}
+
+// Handle export request
+if ($_GET['action'] ?? '' === 'export_tickets') {
+    header('Content-Type: text/csv');
+    header('Content-Disposition: attachment; filename="support_tickets_' . date('Y-m-d') . '.csv"');
+    
+    $output = fopen('php://output', 'w');
+    fputcsv($output, ['Ticket ID', 'Customer', 'Subject', 'Category', 'Priority', 'Status', 'Assigned To', 'Created Date', 'Last Updated', 'Contact Method', 'Due Date']);
+    
+    try {
+        $possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
+        $ticketTable = null;
+        foreach ($possibleTicketTables as $tbl) {
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
+            $stmt->execute([$tbl]);
+            if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
+        }
+        
+        if ($ticketTable) {
+            $stmt = $pdo->prepare("
+                SELECT t.TicketID, t.Subject, t.Category, t.Priority, t.Status, t.CreatedAt, t.UpdatedAt,
+                       t.ContactMethod, t.DueDate,
+                       c.FirstName, c.LastName, u.FirstName AS agent_first, u.LastName AS agent_last
+                FROM `{$ticketTable}` t
+                LEFT JOIN customers c ON t.CustomerID = c.CustomerID
+                LEFT JOIN users u ON t.AssignedTo = u.UserID
+                ORDER BY t.CreatedAt DESC
+            ");
+            $stmt->execute();
+            $tickets = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            
+            foreach ($tickets as $ticket) {
+                $customerName = trim(($ticket['FirstName'] ?? '') . ' ' . ($ticket['LastName'] ?? ''));
+                $agentName = trim(($ticket['agent_first'] ?? '') . ' ' . ($ticket['agent_last'] ?? '')) ?: 'Unassigned';
+                
+                fputcsv($output, [
+                    '#TKT-' . $ticket['TicketID'],
+                    $customerName ?: 'Customer',
+                    $ticket['Subject'],
+                    $ticket['Category'],
+                    $ticket['Priority'],
+                    $ticket['Status'],
+                    $agentName,
+                    $ticket['CreatedAt'],
+                    $ticket['UpdatedAt'],
+                    $ticket['ContactMethod'],
+                    $ticket['DueDate']
+                ]);
+            }
+        }
+    } catch (Exception $e) {
+        // Handle error
+    }
+    
+    fclose($output);
+    exit();
+}
+
+// Helper function to get initials
+function getInitials($name) {
+    $parts = array_filter(explode(' ', $name));
+    $initials = '';
+    foreach ($parts as $part) {
+        $initials .= strtoupper(substr($part, 0, 1));
+    }
+    return $initials ?: '?';
+}
+
+// Function to get ticket statistics
+function getTicketStats($pdo, $ticketTable) {
+    $stats = [];
+    
+    $stmt = $pdo->query("SELECT COUNT(*) FROM `{$ticketTable}`");
+    $stats['totalTickets'] = (int)$stmt->fetchColumn();
+
+    $stmt = $pdo->query("SELECT COUNT(*) FROM `{$ticketTable}` WHERE Status IN ('Open','open')");
+    $stats['openTickets'] = (int)$stmt->fetchColumn();
+
+    $stmt = $pdo->query("SELECT COUNT(*) FROM `{$ticketTable}` WHERE Status IN ('In Progress','in progress','Progress')");
+    $stats['inProgress'] = (int)$stmt->fetchColumn();
+
+    $stmt = $pdo->query("SELECT COUNT(*) FROM `{$ticketTable}` WHERE Status IN ('Resolved','Closed','closed')");
+    $stats['resolved'] = (int)$stmt->fetchColumn();
+
+    $stmt = $pdo->query("SELECT AVG(TIMESTAMPDIFF(HOUR, CreatedAt, FirstResponseAt)) FROM `{$ticketTable}` WHERE FirstResponseAt IS NOT NULL");
+    $stats['avgResponseHours'] = round((float)$stmt->fetchColumn(), 1);
+
+    $stmt = $pdo->query("SELECT COUNT(*) FROM `{$ticketTable}` WHERE FeedbackScore IS NOT NULL");
+    $fbCount = (int)$stmt->fetchColumn();
+    $stats['satisfactionRate'] = 0;
+    if ($fbCount > 0) {
+        $stmt = $pdo->query("SELECT AVG(FeedbackScore) FROM `{$ticketTable}` WHERE FeedbackScore IS NOT NULL");
+        $avgScore = (float)$stmt->fetchColumn();
+        $stats['satisfactionRate'] = round(($avgScore / 5) * 100, 1);
+    }
+    
+    return $stats;
+}
+
+// Function to get filtered tickets
+function getFilteredTickets($pdo, $ticketTable, $filters) {
+    $whereConditions = [];
+    $params = [];
+    
+    if (!empty($filters['status']) && $filters['status'] !== 'All Status') {
+        $statusMap = [
+            'Open' => ['Open','open'],
+            'In Progress' => ['In Progress','in progress','Progress'],
+            'Resolved' => ['Resolved'],
+            'Closed' => ['Closed','closed']
+        ];
+        
+        if (isset($statusMap[$filters['status']])) {
+            $placeholders = implode(',', array_fill(0, count($statusMap[$filters['status']]), '?'));
+            $whereConditions[] = "t.Status IN ($placeholders)";
+            $params = array_merge($params, $statusMap[$filters['status']]);
+        }
+    }
+    
+    if (!empty($filters['priority']) && $filters['priority'] !== 'All Priority') {
+        $whereConditions[] = "t.Priority = ?";
+        $params[] = $filters['priority'];
+    }
+    
+    if (!empty($filters['category']) && $filters['category'] !== 'All Categories') {
+        $whereConditions[] = "t.Category = ?";
+        $params[] = $filters['category'];
+    }
+    
+    if (!empty($filters['date_range']) && $filters['date_range'] !== 'All Time') {
+        $dateConditions = [
+            'Today' => "DATE(t.CreatedAt) = CURDATE()",
+            'This Week' => "YEARWEEK(t.CreatedAt) = YEARWEEK(CURDATE())",
+            'This Month' => "MONTH(t.CreatedAt) = MONTH(CURDATE()) AND YEAR(t.CreatedAt) = YEAR(CURDATE())"
+        ];
+        
+        if (isset($dateConditions[$filters['date_range']])) {
+            $whereConditions[] = $dateConditions[$filters['date_range']];
+        }
+    }
+    
+    if (!empty($filters['search'])) {
+        $searchTerm = '%' . $filters['search'] . '%';
+        $whereConditions[] = "(t.Subject LIKE ? OR t.Description LIKE ? OR c.FirstName LIKE ? OR c.LastName LIKE ? OR t.Tags LIKE ?)";
+        $params = array_merge($params, [$searchTerm, $searchTerm, $searchTerm, $searchTerm, $searchTerm]);
+    }
+    
+    $whereClause = '';
+    if (!empty($whereConditions)) {
+        $whereClause = 'WHERE ' . implode(' AND ', $whereConditions);
+    }
+    
+    $countSql = "SELECT COUNT(*) FROM `{$ticketTable}` t LEFT JOIN customers c ON t.CustomerID = c.CustomerID $whereClause";
+    $stmt = $pdo->prepare($countSql);
+    $stmt->execute($params);
+    $totalCount = (int)$stmt->fetchColumn();
+    
+    $ticketsSql = "
+        SELECT t.TicketID AS id, t.CustomerID, t.Subject AS subject, t.Description AS description, 
+               t.Category AS category, t.Priority AS priority, t.Status AS status, 
+               t.AssignedTo AS assigned_id, t.CreatedAt AS created, t.UpdatedAt AS updated, 
+               t.SaleRef AS sale_ref, t.ContactMethod, t.DueDate, t.Tags,
+               c.FirstName, c.LastName, 
+               u.FirstName AS agent_first, u.LastName AS agent_last
+        FROM `{$ticketTable}` t
+        LEFT JOIN customers c ON t.CustomerID = c.CustomerID
+        LEFT JOIN users u ON t.AssignedTo = u.UserID
+        $whereClause
+        ORDER BY t.CreatedAt DESC 
+        LIMIT 50
+    ";
+    
+    $stmt = $pdo->prepare($ticketsSql);
+    $stmt->execute($params);
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    $tickets = [];
+    foreach ($rows as $r) {
+        $custName = trim(($r['FirstName'] ?? '') . ' ' . ($r['LastName'] ?? '')) ?: 'Customer';
+        $agentName = trim(($r['agent_first'] ?? '') . ' ' . ($r['agent_last'] ?? '')) ?: '—';
+        $tickets[] = [
+            'id' => '#TKT-' . ($r['id'] ?? '0'),
+            'customer' => $custName,
+            'customer_initials' => getInitials($custName),
+            'subject' => $r['subject'] ?? '',
+            'description' => $r['description'] ?? '',
+            'category' => $r['category'] ?? 'Inquiry',
+            'priority' => $r['priority'] ?? 'Medium',
+            'status' => $r['status'] ?? 'Open',
+            'assigned' => $agentName,
+            'assigned_initials' => getInitials($agentName),
+            'created' => isset($r['created']) ? date('M d, Y H:i', strtotime($r['created'])) : '',
+            'updated' => isset($r['updated']) ? date('M d, Y H:i', strtotime($r['updated'])) : '',
+            'sale_ref' => $r['sale_ref'] ?? '-',
+            'contact_method' => $r['ContactMethod'] ?? 'Email',
+            'due_date' => $r['DueDate'] ? date('M d, Y', strtotime($r['DueDate'])) : '',
+            'tags' => $r['Tags'] ?? ''
+        ];
+    }
+    
+    return ['tickets' => $tickets, 'total_count' => $totalCount];
+}
+
+// Prepare data holders
+$totalTickets = 0;
+$openTickets = 0;
+$inProgress = 0;
+$resolved = 0;
+$avgResponseHours = 0;
+$satisfactionRate = 0;
+$tickets = [];
+$customersForSelect = [];
+$agentsForSelect = [];
+$storesForSelect = [];
+
+$possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
+$ticketTable = null;
+foreach ($possibleTicketTables as $tbl) {
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
+    $stmt->execute([$tbl]);
+    if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
+}
+
+try {
+    if ($ticketTable) {
+        $stats = getTicketStats($pdo, $ticketTable);
+        $totalTickets = $stats['totalTickets'];
+        $openTickets = $stats['openTickets'];
+        $inProgress = $stats['inProgress'];
+        $resolved = $stats['resolved'];
+        $avgResponseHours = $stats['avgResponseHours'];
+        $satisfactionRate = $stats['satisfactionRate'];
+
+        $ticketsData = getFilteredTickets($pdo, $ticketTable, []);
+        $tickets = $ticketsData['tickets'];
+    } else {
+        $stmt = $pdo->prepare("SELECT s.SaleID, s.SaleDate, c.FirstName, c.LastName FROM sales s LEFT JOIN customers c ON s.CustomerID = c.CustomerID ORDER BY s.SaleDate DESC LIMIT 50");
+        $stmt->execute();
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($rows as $i => $r) {
+            $custName = trim(($r['FirstName'] ?? '') . ' ' . ($r['LastName'] ?? '')) ?: 'Customer';
+            $tickets[] = [
+                'id' => '#TKT-F' . ($r['SaleID'] ?? $i),
+                'customer' => $custName,
+                'customer_initials' => getInitials($custName),
+                'subject' => 'Order inquiry',
+                'description' => 'Customer inquiry related to sale',
+                'category' => 'Order Issue',
+                'priority' => 'Medium',
+                'status' => 'Open',
+                'assigned' => 'Unassigned',
+                'assigned_initials' => '—',
+                'created' => isset($r['SaleDate']) ? date('M d, Y H:i', strtotime($r['SaleDate'])) : '',
+                'updated' => isset($r['SaleDate']) ? date('M d, Y H:i', strtotime($r['SaleDate'])) : '',
+                'sale_ref' => isset($r['SaleID']) ? ('#SALE-' . $r['SaleID']) : '-',
+                'contact_method' => 'Email',
+                'due_date' => '',
+                'tags' => ''
+            ];
+        }
+
+        $totalTickets = count($tickets);
+        $openTickets = $totalTickets;
+    }
+
+    $stmt = $pdo->query("SELECT UserID, FirstName, LastName, Role FROM users WHERE Role IN ('Support','Agent','Admin','Manager') ORDER BY FirstName LIMIT 200");
+    $agentsForSelect = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $stmt = $pdo->query("SELECT CustomerID, FirstName, LastName, Email, Phone FROM customers ORDER BY FirstName LIMIT 200");
+    $customersForSelect = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
+    $stmt->execute(['stores']);
+    if ($stmt->fetchColumn() > 0) {
+        $stmt2 = $pdo->query("SELECT StoreID, StoreName, Location FROM stores ORDER BY StoreName LIMIT 100");
+        $storesForSelect = $stmt2->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+} catch (Exception $e) {
+    // keep defaults on error
+}
+
+$stats_dynamic = [
+    ['icon'=>'🎫','value'=>number_format($totalTickets),'label'=>'Total Tickets','sublabel'=>'All time','trend'=>'+0.0%','trend_dir'=>'up','color'=>'#dbeafe'],
+    ['icon'=>'🔓','value'=>number_format($openTickets),'label'=>'Open Tickets','sublabel'=>'Awaiting response','trend'=>'','trend_dir'=>'down','color'=>'#fee2e2'],
+    ['icon'=>'⏳','value'=>number_format($inProgress),'label'=>'In Progress','sublabel'=>'Being handled','trend'=>'','trend_dir'=>'up','color'=>'#fef3c7'],
+    ['icon'=>'✅','value'=>number_format($resolved),'label'=>'Resolved','sublabel'=>'Closed tickets','trend'=>'','trend_dir'=>'up','color'=>'#d1fae5'],
+    ['icon'=>'⏱️','value'=>($avgResponseHours ? $avgResponseHours . ' hrs' : 'N/A'),'label'=>'Avg Response Time','sublabel'=>'First response','trend'=>'','trend_dir'=>'up','color'=>'#e9d5ff'],
+    ['icon'=>'📈','value'=>($satisfactionRate ? $satisfactionRate . '%' : 'N/A'),'label'=>'Satisfaction Rate','sublabel'=>'Customer feedback','trend'=>'','trend_dir'=>'up','color'=>'#ddd6fe']
+];
+
+?>
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -24,7 +702,7 @@
             <div class="nav-right">
                 <div class="search-wrapper">
                     <span class="search-icon">🔍</span>
-                    <input type="text" class="search-box" placeholder="Search tickets...">
+                    <input type="text" class="search-box" placeholder="Search tickets..." id="globalSearch">
                 </div>
                 <button class="notification-btn">
                     🔔
@@ -49,11 +727,11 @@
                 <p class="page-subtitle">Manage support tickets and customer inquiries</p>
             </div>
             <div class="header-actions">
-                <button class="btn btn-secondary">
+                <button class="btn btn-secondary" onclick="generateReports()">
                     <span>📊</span>
                     <span>Reports</span>
                 </button>
-                <button class="btn btn-secondary">
+                <button class="btn btn-secondary" onclick="exportTickets()">
                     <span>📥</span>
                     <span>Export</span>
                 </button>
@@ -64,66 +742,9 @@
             </div>
         </div>
 
-        <!-- Stats Grid -->
-        <div class="stats-grid">
+        <div class="stats-grid" id="statsGrid">
             <?php
-            $stats = [
-                [
-                    'icon' => '🎫',
-                    'value' => '342',
-                    'label' => 'Total Tickets',
-                    'sublabel' => 'All time',
-                    'trend' => '+8.5%',
-                    'trend_dir' => 'up',
-                    'color' => '#dbeafe'
-                ],
-                [
-                    'icon' => '🔓',
-                    'value' => '45',
-                    'label' => 'Open Tickets',
-                    'sublabel' => 'Awaiting response',
-                    'trend' => '-12.3%',
-                    'trend_dir' => 'down',
-                    'color' => '#fee2e2'
-                ],
-                [
-                    'icon' => '⏳',
-                    'value' => '28',
-                    'label' => 'In Progress',
-                    'sublabel' => 'Being handled',
-                    'trend' => '+5.2%',
-                    'trend_dir' => 'up',
-                    'color' => '#fef3c7'
-                ],
-                [
-                    'icon' => '✅',
-                    'value' => '256',
-                    'label' => 'Resolved',
-                    'sublabel' => 'Closed tickets',
-                    'trend' => '+15.8%',
-                    'trend_dir' => 'up',
-                    'color' => '#d1fae5'
-                ],
-                [
-                    'icon' => '⏱️',
-                    'value' => '2.5hrs',
-                    'label' => 'Avg Response Time',
-                    'sublabel' => 'First response',
-                    'trend' => '-18.2%',
-                    'trend_dir' => 'up',
-                    'color' => '#e9d5ff'
-                ],
-                [
-                    'icon' => '📈',
-                    'value' => '94%',
-                    'label' => 'Satisfaction Rate',
-                    'sublabel' => 'Customer feedback',
-                    'trend' => '+3.1%',
-                    'trend_dir' => 'up',
-                    'color' => '#ddd6fe'
-                ]
-            ];
-
+            $stats = $stats_dynamic;
             foreach ($stats as $stat) {
                 echo '<div class="stat-card">';
                 echo '<div class="stat-header">';
@@ -141,71 +762,76 @@
             ?>
         </div>
 
-        <!-- Filters Section -->
         <div class="filters-section">
             <div class="filters-header">
                 <div class="filters-title">🔍 Filter Support Tickets</div>
-                <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 13px;">Reset Filters</button>
+                <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 13px;" onclick="resetFilters()">Reset Filters</button>
             </div>
             <div class="filters-grid">
                 <div class="filter-group">
                     <label class="filter-label">Status</label>
-                    <select class="filter-select">
-                        <option>All Status</option>
-                        <option>Open</option>
-                        <option>In Progress</option>
-                        <option>Resolved</option>
-                        <option>Closed</option>
+                    <select class="filter-select" id="statusFilter">
+                        <option value="All Status">All Status</option>
+                        <option value="Open">Open</option>
+                        <option value="In Progress">In Progress</option>
+                        <option value="Resolved">Resolved</option>
+                        <option value="Closed">Closed</option>
                     </select>
                 </div>
                 <div class="filter-group">
                     <label class="filter-label">Priority</label>
-                    <select class="filter-select">
-                        <option>All Priority</option>
-                        <option>Critical</option>
-                        <option>High</option>
-                        <option>Medium</option>
-                        <option>Low</option>
+                    <select class="filter-select" id="priorityFilter">
+                        <option value="All Priority">All Priority</option>
+                        <option value="Critical">Critical</option>
+                        <option value="High">High</option>
+                        <option value="Medium">Medium</option>
+                        <option value="Low">Low</option>
                     </select>
                 </div>
                 <div class="filter-group">
                     <label class="filter-label">Category</label>
-                    <select class="filter-select">
-                        <option>All Categories</option>
-                        <option>Product Issue</option>
-                        <option>Order Issue</option>
-                        <option>Refund Request</option>
-                        <option>Complaint</option>
-                        <option>Inquiry</option>
+                    <select class="filter-select" id="categoryFilter">
+                        <option value="All Categories">All Categories</option>
+                        <option value="Product Issue">Product Issue</option>
+                        <option value="Order Issue">Order Issue</option>
+                        <option value="Refund Request">Refund Request</option>
+                        <option value="Billing Issue">Billing Issue</option>
+                        <option value="Technical Support">Technical Support</option>
+                        <option value="Account Issue">Account Issue</option>
+                        <option value="Shipping Issue">Shipping Issue</option>
+                        <option value="Complaint">Complaint</option>
+                        <option value="Inquiry">Inquiry</option>
+                        <option value="Feature Request">Feature Request</option>
                     </select>
                 </div>
                 <div class="filter-group">
                     <label class="filter-label">Date Range</label>
-                    <select class="filter-select">
-                        <option>All Time</option>
-                        <option>Today</option>
-                        <option>This Week</option>
-                        <option>This Month</option>
+                    <select class="filter-select" id="dateFilter">
+                        <option value="All Time">All Time</option>
+                        <option value="Today">Today</option>
+                        <option value="This Week">This Week</option>
+                        <option value="This Month">This Month</option>
                     </select>
                 </div>
             </div>
         </div>
 
-        <!-- Support Tickets Table -->
         <div class="content-card">
             <div class="card-header">
-                <h2 class="section-title">Support Tickets (342)</h2>
+                <h2 class="section-title">Support Tickets (<span id="ticketCount"><?php echo count($tickets); ?></span>)</h2>
                 <div class="card-actions">
-                    <button class="icon-btn" title="Filter">🔽</button>
-                    <button class="icon-btn" title="Sort">⇅</button>
-                    <button class="icon-btn" title="Refresh">🔄</button>
+                    <button class="icon-btn" title="Refresh" onclick="refreshTickets()">🔄</button>
+                    <div class="realtime-indicator" id="realtimeIndicator" style="display: none;">
+                        <div class="pulse-dot"></div>
+                        <span>Live Updates</span>
+                    </div>
                 </div>
             </div>
             <div class="table-wrapper">
                 <table class="table">
                     <thead>
                         <tr>
-                            <th><input type="checkbox"></th>
+                            <th><input type="checkbox" id="selectAll"></th>
                             <th>Ticket ID</th>
                             <th>Customer</th>
                             <th>Subject</th>
@@ -218,195 +844,10 @@
                             <th>Actions</th>
                         </tr>
                     </thead>
-                    <tbody>
+                    <tbody id="ticketsTableBody">
                         <?php
-                        $tickets = [
-                            [
-                                'id' => '#TKT-001',
-                                'customer' => 'John Santos',
-                                'customer_initials' => 'JS',
-                                'subject' => 'Defective shoes - Size 42',
-                                'description' => 'Customer received shoes with manufacturing defect',
-                                'category' => 'Product Issue',
-                                'priority' => 'High',
-                                'status' => 'Open',
-                                'assigned' => 'Maria Lopez',
-                                'assigned_initials' => 'ML',
-                                'created' => '2 hours ago',
-                                'updated' => '1 hour ago',
-                                'sale_ref' => '#SALE-5678'
-                            ],
-                            [
-                                'id' => '#TKT-002',
-                                'customer' => 'Ana Reyes',
-                                'customer_initials' => 'AR',
-                                'subject' => 'Wrong size delivered',
-                                'description' => 'Ordered size 38 but received size 40',
-                                'category' => 'Order Issue',
-                                'priority' => 'High',
-                                'status' => 'In Progress',
-                                'assigned' => 'Carlos Diaz',
-                                'assigned_initials' => 'CD',
-                                'created' => '5 hours ago',
-                                'updated' => '30 mins ago',
-                                'sale_ref' => '#SALE-5645'
-                            ],
-                            [
-                                'id' => '#TKT-003',
-                                'customer' => 'Robert Chen',
-                                'customer_initials' => 'RC',
-                                'subject' => 'Refund request for damaged item',
-                                'description' => 'Item damaged during shipping',
-                                'category' => 'Refund Request',
-                                'priority' => 'Medium',
-                                'status' => 'In Progress',
-                                'assigned' => 'Maria Lopez',
-                                'assigned_initials' => 'ML',
-                                'created' => '1 day ago',
-                                'updated' => '2 hours ago',
-                                'sale_ref' => '#SALE-5612'
-                            ],
-                            [
-                                'id' => '#TKT-004',
-                                'customer' => 'Sarah Tan',
-                                'customer_initials' => 'ST',
-                                'subject' => 'Product inquiry - Availability',
-                                'description' => 'Asking about stock for specific model',
-                                'category' => 'Inquiry',
-                                'priority' => 'Low',
-                                'status' => 'Resolved',
-                                'assigned' => 'Juan Cruz',
-                                'assigned_initials' => 'JC',
-                                'created' => '2 days ago',
-                                'updated' => '1 day ago',
-                                'sale_ref' => '-'
-                            ],
-                            [
-                                'id' => '#TKT-005',
-                                'customer' => 'Michael Cruz',
-                                'customer_initials' => 'MC',
-                                'subject' => 'Poor customer service complaint',
-                                'description' => 'Unhappy with staff treatment at store',
-                                'category' => 'Complaint',
-                                'priority' => 'Critical',
-                                'status' => 'Open',
-                                'assigned' => 'Manager',
-                                'assigned_initials' => 'MG',
-                                'created' => '3 hours ago',
-                                'updated' => '2 hours ago',
-                                'sale_ref' => '-'
-                            ],
-                            [
-                                'id' => '#TKT-006',
-                                'customer' => 'Lisa Wong',
-                                'customer_initials' => 'LW',
-                                'subject' => 'Loyalty points not credited',
-                                'description' => 'Points missing from recent purchase',
-                                'category' => 'Inquiry',
-                                'priority' => 'Medium',
-                                'status' => 'Resolved',
-                                'assigned' => 'Carlos Diaz',
-                                'assigned_initials' => 'CD',
-                                'created' => '3 days ago',
-                                'updated' => '2 days ago',
-                                'sale_ref' => '#SALE-5589'
-                            ],
-                            [
-                                'id' => '#TKT-007',
-                                'customer' => 'David Lim',
-                                'customer_initials' => 'DL',
-                                'subject' => 'Exchange request - Different color',
-                                'description' => 'Customer wants to exchange for different color',
-                                'category' => 'Order Issue',
-                                'priority' => 'Low',
-                                'status' => 'In Progress',
-                                'assigned' => 'Juan Cruz',
-                                'assigned_initials' => 'JC',
-                                'created' => '1 day ago',
-                                'updated' => '5 hours ago',
-                                'sale_ref' => '#SALE-5602'
-                            ],
-                            [
-                                'id' => '#TKT-008',
-                                'customer' => 'Maria Garcia',
-                                'customer_initials' => 'MG',
-                                'subject' => 'Delayed delivery complaint',
-                                'description' => 'Order not received within promised timeframe',
-                                'category' => 'Complaint',
-                                'priority' => 'High',
-                                'status' => 'Closed',
-                                'assigned' => 'Maria Lopez',
-                                'assigned_initials' => 'ML',
-                                'created' => '5 days ago',
-                                'updated' => '4 days ago',
-                                'sale_ref' => '#SALE-5534'
-                            ]
-                        ];
-
                         foreach ($tickets as $ticket) {
-                            $statusClass = match($ticket['status']) {
-                                'Open' => 'ticket-status-open',
-                                'In Progress' => 'ticket-status-progress',
-                                'Resolved' => 'ticket-status-resolved',
-                                'Closed' => 'ticket-status-closed',
-                                default => 'ticket-status-open'
-                            };
-
-                            $priorityClass = match($ticket['priority']) {
-                                'Critical' => 'ticket-priority-critical',
-                                'High' => 'priority-high',
-                                'Medium' => 'priority-medium',
-                                'Low' => 'priority-low',
-                                default => 'priority-medium'
-                            };
-
-                            $categoryClass = match($ticket['category']) {
-                                'Product Issue' => 'category-product',
-                                'Order Issue' => 'category-order',
-                                'Refund Request' => 'category-refund',
-                                'Complaint' => 'category-complaint',
-                                'Inquiry' => 'category-inquiry',
-                                default => 'category-inquiry'
-                            };
-                            
-                            echo '<tr>';
-                            echo '<td><input type="checkbox"></td>';
-                            echo '<td><span class="contact-id">' . $ticket['id'] . '</span></td>';
-                            echo '<td>';
-                            echo '<div class="contact-name-cell">';
-                            echo '<div class="contact-avatar">' . $ticket['customer_initials'] . '</div>';
-                            echo '<div class="contact-name-info">';
-                            echo '<div class="contact-name-primary">' . $ticket['customer'] . '</div>';
-                            echo '</div>';
-                            echo '</div>';
-                            echo '</td>';
-                            echo '<td>';
-                            echo '<div class="ticket-subject">';
-                            echo '<div class="ticket-subject-title">' . $ticket['subject'] . '</div>';
-                            echo '<div class="ticket-subject-desc">' . $ticket['description'] . '</div>';
-                            if ($ticket['sale_ref'] !== '-') {
-                                echo '<div class="ticket-sale-ref">🔗 ' . $ticket['sale_ref'] . '</div>';
-                            }
-                            echo '</div>';
-                            echo '</td>';
-                            echo '<td><span class="category-badge ' . $categoryClass . '">' . $ticket['category'] . '</span></td>';
-                            echo '<td><span class="priority-badge ' . $priorityClass . '">' . $ticket['priority'] . '</span></td>';
-                            echo '<td><span class="status-badge ' . $statusClass . '">' . strtoupper($ticket['status']) . '</span></td>';
-                            echo '<td>';
-                            echo '<div class="contact-name-cell">';
-                            echo '<div class="contact-avatar" style="width: 32px; height: 32px; font-size: 12px;">' . $ticket['assigned_initials'] . '</div>';
-                            echo '<span>' . $ticket['assigned'] . '</span>';
-                            echo '</div>';
-                            echo '</td>';
-                            echo '<td>' . $ticket['created'] . '</td>';
-                            echo '<td>' . $ticket['updated'] . '</td>';
-                            echo '<td>';
-                            echo '<div class="action-buttons">';
-                            echo '<button class="action-btn">View</button>';
-                            echo '<button class="action-btn">Update</button>';
-                            echo '</div>';
-                            echo '</td>';
-                            echo '</tr>';
+                            echo renderTicketRow($ticket);
                         }
                         ?>
                     </tbody>
@@ -414,16 +855,16 @@
             </div>
             <div class="table-footer">
                 <div class="showing-text">
-                    Showing <strong>1-8</strong> of <strong>342</strong> tickets
+                    Showing <strong id="showingRange">1-<?php echo min(50, count($tickets)); ?></strong> of <strong id="totalTicketsCount"><?php echo count($tickets); ?></strong> tickets
                 </div>
                 <div class="pagination">
-                    <button>‹</button>
+                    <button onclick="changePage('prev')">‹</button>
                     <button class="active">1</button>
-                    <button>2</button>
-                    <button>3</button>
-                    <button>4</button>
-                    <button>5</button>
-                    <button>›</button>
+                    <button onclick="changePage(2)">2</button>
+                    <button onclick="changePage(3)">3</button>
+                    <button onclick="changePage(4)">4</button>
+                    <button onclick="changePage(5)">5</button>
+                    <button onclick="changePage('next')">›</button>
                 </div>
             </div>
         </div>
@@ -431,9 +872,9 @@
 
     <!-- Create Ticket Modal -->
     <div class="modal-overlay" id="ticketModal">
-        <div class="modal">
+        <div class="modal" style="max-width: 800px;">
             <div class="modal-header">
-                <h3 class="modal-title">Create Support Ticket</h3>
+                <h3 class="modal-title">Create New Support Ticket</h3>
                 <button class="close-btn" onclick="closeTicketModal()">✕</button>
             </div>
             <div class="modal-body">
@@ -441,68 +882,123 @@
                     <div class="form-grid">
                         <div class="form-group full-width">
                             <label class="form-label">Select Customer *</label>
-                            <select class="filter-select" name="customer_id" required>
+                            <select class="filter-select" name="customer_id" required id="customerSelect" onchange="updateCustomerInfo()">
                                 <option value="">Choose customer</option>
-                                <option value="1">John Santos - john.santos@email.com</option>
-                                <option value="2">Maria Garcia - maria.garcia@email.com</option>
-                                <option value="3">Robert Chen - robert.chen@email.com</option>
-                                <option value="4">Ana Reyes - ana.reyes@email.com</option>
-                                <option value="5">David Lim - david.lim@email.com</option>
+                                <?php
+                                foreach ($customersForSelect as $c) {
+                                    $cid = $c['CustomerID'] ?? $c['CustomerID'];
+                                    $name = trim(($c['FirstName'] ?? '') . ' ' . ($c['LastName'] ?? ''));
+                                    $email = $c['Email'] ?? '';
+                                    $phone = $c['Phone'] ?? '';
+                                    echo '<option value="' . htmlspecialchars($cid) . '" data-email="' . htmlspecialchars($email) . '" data-phone="' . htmlspecialchars($phone) . '">' . htmlspecialchars($name) . ($email ? ' - ' . htmlspecialchars($email) : '') . '</option>';
+                                }
+                                ?>
                             </select>
                         </div>
+                        
+                        <div class="form-group">
+                            <label class="form-label">Customer Email</label>
+                            <input type="text" class="form-input" id="customerEmail" readonly style="background: #f5f5f5;">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Customer Phone</label>
+                            <input type="text" class="form-input" id="customerPhone" readonly style="background: #f5f5f5;">
+                        </div>
+
                         <div class="form-group">
                             <label class="form-label">Category *</label>
                             <select class="filter-select" name="category" required>
                                 <option value="">Select category</option>
-                                <option value="product">Product Issue</option>
-                                <option value="order">Order Issue</option>
-                                <option value="refund">Refund Request</option>
-                                <option value="complaint">Complaint</option>
-                                <option value="inquiry">Inquiry</option>
+                                <option value="Product Issue">Product Issue</option>
+                                <option value="Order Issue">Order Issue</option>
+                                <option value="Refund Request">Refund Request</option>
+                                <option value="Billing Issue">Billing Issue</option>
+                                <option value="Technical Support">Technical Support</option>
+                                <option value="Account Issue">Account Issue</option>
+                                <option value="Shipping Issue">Shipping Issue</option>
+                                <option value="Complaint">Complaint</option>
+                                <option value="Inquiry">Inquiry</option>
+                                <option value="Feature Request">Feature Request</option>
                             </select>
                         </div>
+                        
                         <div class="form-group">
                             <label class="form-label">Priority *</label>
                             <select class="filter-select" name="priority" required>
                                 <option value="">Select priority</option>
-                                <option value="critical">Critical</option>
-                                <option value="high">High</option>
-                                <option value="medium">Medium</option>
-                                <option value="low">Low</option>
+                                <option value="Critical">Critical</option>
+                                <option value="High">High</option>
+                                <option value="Medium">Medium</option>
+                                <option value="Low">Low</option>
                             </select>
                         </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Contact Method</label>
+                            <select class="filter-select" name="contact_method">
+                                <option value="Email">Email</option>
+                                <option value="Phone">Phone</option>
+                                <option value="Chat">Chat</option>
+                                <option value="In-Person">In-Person</option>
+                                <option value="Social Media">Social Media</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Due Date</label>
+                            <input type="date" class="form-input" name="due_date" min="<?php echo date('Y-m-d'); ?>">
+                        </div>
+
                         <div class="form-group full-width">
                             <label class="form-label">Subject *</label>
                             <input type="text" class="form-input" name="subject" placeholder="Brief description of the issue" required>
                         </div>
+                        
                         <div class="form-group full-width">
                             <label class="form-label">Description *</label>
                             <textarea class="form-textarea" name="description" placeholder="Detailed description of the issue or inquiry..." required style="min-height: 120px;"></textarea>
                         </div>
+
                         <div class="form-group">
                             <label class="form-label">Related Sale ID</label>
-                            <input type="text" class="form-input" name="sale_id" placeholder="#SALE-0000 (optional)">
+                            <input type="text" class="form-input" name="sale_ref" placeholder="#SALE-0000 (optional)">
                         </div>
+                        
                         <div class="form-group">
                             <label class="form-label">Store Location</label>
                             <select class="filter-select" name="store_id">
                                 <option value="">Select store</option>
-                                <option value="1">Manila Branch</option>
-                                <option value="2">Makati Branch</option>
-                                <option value="3">Quezon City Branch</option>
-                                <option value="4">Cebu Branch</option>
+                                <?php
+                                foreach ($storesForSelect as $s) {
+                                    $sid = $s['StoreID'] ?? $s['StoreID'];
+                                    $sname = $s['StoreName'] ?? $s['StoreName'];
+                                    $location = $s['Location'] ?? '';
+                                    echo '<option value="' . htmlspecialchars($sid) . '">' . htmlspecialchars($sname) . ($location ? ' - ' . htmlspecialchars($location) : '') . '</option>';
+                                }
+                                ?>
                             </select>
                         </div>
+
                         <div class="form-group full-width">
                             <label class="form-label">Assign To *</label>
                             <select class="filter-select" name="assigned_to" required>
                                 <option value="">Select agent</option>
-                                <option value="1">Maria Lopez</option>
-                                <option value="2">Carlos Diaz</option>
-                                <option value="3">Juan Cruz</option>
-                                <option value="4">Manager</option>
+                                <?php
+                                foreach ($agentsForSelect as $a) {
+                                    $aid = $a['UserID'] ?? $a['UserID'];
+                                    $aname = trim(($a['FirstName'] ?? '') . ' ' . ($a['LastName'] ?? ''));
+                                    $role = $a['Role'] ?? '';
+                                    echo '<option value="' . htmlspecialchars($aid) . '">' . htmlspecialchars($aname) . ($role ? ' (' . htmlspecialchars($role) . ')' : '') . '</option>';
+                                }
+                                ?>
                             </select>
                         </div>
+
+                        <div class="form-group full-width">
+                            <label class="form-label">Tags</label>
+                            <input type="text" class="form-input" name="tags" placeholder="urgent, vip, technical (comma separated)">
+                        </div>
+
                         <div class="form-group full-width">
                             <label class="form-label">Internal Notes</label>
                             <textarea class="form-textarea" name="notes" placeholder="Add internal notes (not visible to customer)..."></textarea>
@@ -512,105 +1008,747 @@
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeTicketModal()">Cancel</button>
-                <button class="btn btn-primary" onclick="saveTicket()">Create Ticket</button>
+                <button class="btn btn-primary" id="createTicketBtn" type="button">Create Ticket</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Update Ticket Modal -->
+    <div class="modal-overlay" id="updateTicketModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 class="modal-title">Update Ticket Status</h3>
+                <button class="close-btn" onclick="closeUpdateModal()">✕</button>
+            </div>
+            <div class="modal-body">
+                <form id="updateTicketForm">
+                    <input type="hidden" id="updateTicketId" name="ticket_id">
+                    <div class="form-group full-width">
+                        <label class="form-label">Status *</label>
+                        <select class="filter-select" id="updateStatus" name="status" required>
+                            <option value="Open">Open</option>
+                            <option value="In Progress">In Progress</option>
+                            <option value="Resolved">Resolved</option>
+                            <option value="Closed">Closed</option>
+                        </select>
+                    </div>
+                    <div class="form-group full-width">
+                        <label class="form-label">Customer Feedback Score (1-5)</label>
+                        <select class="filter-select" id="feedbackScore" name="feedback_score">
+                            <option value="">No feedback yet</option>
+                            <option value="1">1 - Very Poor</option>
+                            <option value="2">2 - Poor</option>
+                            <option value="3">3 - Average</option>
+                            <option value="4">4 - Good</option>
+                            <option value="5">5 - Excellent</option>
+                        </select>
+                    </div>
+                    <div class="form-group full-width">
+                        <label class="form-label">Additional Notes</label>
+                        <textarea class="form-textarea" id="updateNotes" name="notes" placeholder="Add update notes..."></textarea>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeUpdateModal()">Cancel</button>
+                <button class="btn btn-primary" id="updateTicketBtn" type="button">Update Ticket</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- View Ticket Modal -->
+    <div class="modal-overlay" id="viewTicketModal">
+        <div class="modal" style="max-width: 900px;">
+            <div class="modal-header">
+                <h3 class="modal-title">Ticket Details</h3>
+                <button class="close-btn" onclick="closeViewModal()">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="ticket-details-container">
+                    <div class="details-grid">
+                        <div class="detail-section full-width">
+                            <div class="ticket-header">
+                                <div class="ticket-id-badge" id="viewTicketId">#TKT-0000</div>
+                                <div class="ticket-status-badge" id="viewTicketStatus">Open</div>
+                                <div class="ticket-priority-badge" id="viewTicketPriority">Medium</div>
+                            </div>
+                            <h4 class="ticket-subject" id="viewTicketSubject">Ticket Subject</h4>
+                        </div>
+
+                        <div class="detail-section">
+                            <h4 class="section-title">Customer Information</h4>
+                            <div class="detail-item">
+                                <label>Name:</label>
+                                <span id="viewCustomerName">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <label>Email:</label>
+                                <span id="viewCustomerEmail">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <label>Phone:</label>
+                                <span id="viewCustomerPhone">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <label>Address:</label>
+                                <span id="viewCustomerAddress">—</span>
+                            </div>
+                        </div>
+
+                        <div class="detail-section">
+                            <h4 class="section-title">Ticket Information</h4>
+                            <div class="detail-item">
+                                <label>Category:</label>
+                                <span id="viewTicketCategory">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <label>Priority:</label>
+                                <span id="viewTicketPriorityText">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <label>Status:</label>
+                                <span id="viewTicketStatusText">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <label>Contact Method:</label>
+                                <span id="viewContactMethod">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <label>Due Date:</label>
+                                <span id="viewDueDate">—</span>
+                            </div>
+                        </div>
+
+                        <div class="detail-section">
+                            <h4 class="section-title">Assignment</h4>
+                            <div class="detail-item">
+                                <label>Assigned To:</label>
+                                <span id="viewAssignedTo">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <label>Agent Email:</label>
+                                <span id="viewAgentEmail">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <label>Store:</label>
+                                <span id="viewStoreInfo">—</span>
+                            </div>
+                        </div>
+
+                        <div class="detail-section">
+                            <h4 class="section-title">Related Information</h4>
+                            <div class="detail-item">
+                                <label>Sale Reference:</label>
+                                <span id="viewSaleRef">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <label>Tags:</label>
+                                <span id="viewTags">—</span>
+                            </div>
+                            <div class="detail-item">
+                                <label>Feedback Score:</label>
+                                <span id="viewFeedbackScore">—</span>
+                            </div>
+                        </div>
+
+                        <div class="detail-section full-width">
+                            <h4 class="section-title">Timeline</h4>
+                            <div class="timeline">
+                                <div class="timeline-item">
+                                    <div class="timeline-marker"></div>
+                                    <div class="timeline-content">
+                                        <strong>Created</strong>
+                                        <span id="viewCreatedAt">—</span>
+                                    </div>
+                                </div>
+                                <div class="timeline-item">
+                                    <div class="timeline-marker"></div>
+                                    <div class="timeline-content">
+                                        <strong>First Response</strong>
+                                        <span id="viewFirstResponse">—</span>
+                                    </div>
+                                </div>
+                                <div class="timeline-item">
+                                    <div class="timeline-marker"></div>
+                                    <div class="timeline-content">
+                                        <strong>Last Updated</strong>
+                                        <span id="viewUpdatedAt">—</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="detail-section full-width">
+                            <h4 class="section-title">Description</h4>
+                            <div class="description-content" id="viewDescription">—</div>
+                        </div>
+
+                        <div class="detail-section full-width">
+                            <h4 class="section-title">Internal Notes</h4>
+                            <div class="notes-content" id="viewInternalNotes">—</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeViewModal()">Close</button>
+                <button class="btn btn-primary" onclick="editCurrentTicket()">Edit Ticket</button>
             </div>
         </div>
     </div>
 
     <style>
-        /* Ticket-specific styles */
-        .ticket-subject {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
+        .modal {
+            max-width: 800px;
+            max-height: 90vh;
+            overflow-y: auto;
         }
 
-        .ticket-subject-title {
-            font-weight: 600;
-            color: var(--gray-900);
+        .form-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+
+        .form-group.full-width {
+            grid-column: 1 / -1;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 6px;
+            font-weight: 500;
+            color: #374151;
             font-size: 14px;
         }
 
-        .ticket-subject-desc {
-            font-size: 12px;
-            color: var(--gray-600);
-            line-height: 1.4;
+        .form-input, .filter-select, .form-textarea {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: all 0.2s;
         }
 
-        .ticket-sale-ref {
-            font-size: 11px;
-            color: var(--primary);
+        .form-input:focus, .filter-select:focus, .form-textarea:focus {
+            outline: none;
+            border-color: #3b82f6;
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+        }
+
+        .form-textarea {
+            resize: vertical;
+            min-height: 80px;
+        }
+
+        .ticket-details-container {
+            padding: 0;
+        }
+
+        .details-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .detail-section.full-width {
+            grid-column: 1 / -1;
+        }
+
+        .detail-section {
+            background: #f8fafc;
+            padding: 16px;
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
+        }
+
+        .section-title {
+            font-size: 16px;
             font-weight: 600;
-            margin-top: 4px;
+            color: #1e293b;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #3b82f6;
         }
 
-        /* Ticket Status Badges */
-        .ticket-status-open {
-            background: #dbeafe;
-            color: #1e40af;
+        .detail-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 8px;
+            padding: 6px 0;
         }
 
-        .ticket-status-progress {
-            background: #fef3c7;
-            color: #92400e;
+        .detail-item label {
+            font-weight: 500;
+            color: #64748b;
+            min-width: 120px;
         }
 
-        .ticket-status-resolved {
-            background: #d1fae5;
-            color: #065f46;
+        .detail-item span {
+            color: #1e293b;
+            text-align: right;
+            flex: 1;
         }
 
-        .ticket-status-closed {
-            background: #f3f4f6;
-            color: #4b5563;
-        }
-
-        /* Priority Badges */
-        .ticket-priority-critical {
-            background: #fecaca;
-            color: #991b1b;
-        }
-
-        /* Category Badges */
-        .category-badge {
-            display: inline-flex;
+        .ticket-header {
+            display: flex;
             align-items: center;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .ticket-id-badge {
+            background: #1e293b;
+            color: white;
             padding: 6px 12px;
             border-radius: 6px;
-            font-size: 12px;
             font-weight: 600;
+            font-size: 14px;
         }
 
-        .category-product {
-            background: #fee2e2;
-            color: #991b1b;
+        .ticket-status-badge, .ticket-priority-badge {
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 12px;
+            text-transform: uppercase;
         }
 
-        .category-order {
-            background: #dbeafe;
-            color: #1e40af;
+        .ticket-subject {
+            font-size: 20px;
+            font-weight: 600;
+            color: #1e293b;
+            margin: 0;
         }
 
-        .category-refund {
-            background: #fef3c7;
-            color: #92400e;
+        .description-content, .notes-content {
+            background: white;
+            padding: 16px;
+            border-radius: 6px;
+            border: 1px solid #e2e8f0;
+            line-height: 1.6;
+            white-space: pre-wrap;
         }
 
-        .category-complaint {
-            background: #fecaca;
-            color: #7f1d1d;
+        .timeline {
+            position: relative;
+            padding-left: 20px;
         }
 
-        .category-inquiry {
-            background: #e0e7ff;
-            color: #3730a3;
+        .timeline-item {
+            position: relative;
+            margin-bottom: 16px;
+        }
+
+        .timeline-marker {
+            position: absolute;
+            left: -20px;
+            top: 6px;
+            width: 8px;
+            height: 8px;
+            background: #3b82f6;
+            border-radius: 50%;
+        }
+
+        .timeline-content {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .timeline-content strong {
+            color: #1e293b;
+        }
+
+        .timeline-content span {
+            color: #64748b;
+            font-size: 14px;
+        }
+
+        .status-open { background: #dbeafe; color: #1e40af; }
+        .status-progress { background: #fef3c7; color: #92400e; }
+        .status-resolved { background: #d1fae5; color: #065f46; }
+        .status-closed { background: #f3f4f6; color: #4b5563; }
+
+        .priority-critical { background: #fecaca; color: #991b1b; }
+        .priority-high { background: #fed7aa; color: #9a3412; }
+        .priority-medium { background: #fef08a; color: #854d0e; }
+        .priority-low { background: #dcfce7; color: #166534; }
+
+        .btn-loading {
+            position: relative;
+            color: transparent !important;
+        }
+
+        .btn-loading::after {
+            content: '';
+            position: absolute;
+            width: 16px;
+            height: 16px;
+            top: 50%;
+            left: 50%;
+            margin-left: -8px;
+            margin-top: -8px;
+            border: 2px solid #ffffff;
+            border-radius: 50%;
+            border-right-color: transparent;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .btn {
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn:disabled {
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+
+        .btn-primary {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-weight: 500;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: #2563eb;
+        }
+
+        .btn-secondary {
+            background: #6b7280;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-weight: 500;
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: #4b5563;
         }
     </style>
 
     <script>
-        // Modal Functions
+        let currentFilters = {
+            status: 'All Status',
+            priority: 'All Priority',
+            category: 'All Categories',
+            date_range: 'All Time',
+            search: ''
+        };
+        let lastUpdateTime = '<?php echo date('Y-m-d H:i:s'); ?>';
+        let realtimeInterval = null;
+        let currentPage = 1;
+        const itemsPerPage = 50;
+
+        function updateCustomerInfo() {
+            const customerSelect = document.getElementById('customerSelect');
+            const selectedOption = customerSelect.options[customerSelect.selectedIndex];
+            const email = selectedOption.getAttribute('data-email') || '';
+            const phone = selectedOption.getAttribute('data-phone') || '';
+            
+            document.getElementById('customerEmail').value = email;
+            document.getElementById('customerPhone').value = phone;
+        }
+
+        async function viewTicket(ticketId) {
+            try {
+                const response = await fetch(`?action=get_ticket_details&ticket_id=${encodeURIComponent(ticketId)}`);
+                const data = await response.json();
+                
+                if (data.success) {
+                    displayTicketDetails(data.ticket);
+                    openViewModal();
+                } else {
+                    showError('Error loading ticket: ' + data.message);
+                }
+            } catch (error) {
+                showError('Error loading ticket details: ' + error.message);
+            }
+        }
+
+        function displayTicketDetails(ticket) {
+            document.getElementById('viewTicketId').textContent = ticket.id;
+            document.getElementById('viewTicketSubject').textContent = ticket.subject;
+            
+            const statusBadge = document.getElementById('viewTicketStatus');
+            statusBadge.textContent = ticket.status;
+            statusBadge.className = 'ticket-status-badge status-' + ticket.status.toLowerCase().replace(' ', '-');
+            
+            const priorityBadge = document.getElementById('viewTicketPriority');
+            priorityBadge.textContent = ticket.priority;
+            priorityBadge.className = 'ticket-priority-badge priority-' + ticket.priority.toLowerCase();
+
+            document.getElementById('viewCustomerName').textContent = ticket.customer_name;
+            document.getElementById('viewCustomerEmail').textContent = ticket.customer_email;
+            document.getElementById('viewCustomerPhone').textContent = ticket.customer_phone || '—';
+            document.getElementById('viewCustomerAddress').textContent = ticket.customer_address || '—';
+
+            document.getElementById('viewTicketCategory').textContent = ticket.category;
+            document.getElementById('viewTicketPriorityText').textContent = ticket.priority;
+            document.getElementById('viewTicketStatusText').textContent = ticket.status;
+            document.getElementById('viewContactMethod').textContent = ticket.contact_method;
+            document.getElementById('viewDueDate').textContent = ticket.due_date;
+
+            document.getElementById('viewAssignedTo').textContent = ticket.assigned_to;
+            document.getElementById('viewAgentEmail').textContent = ticket.assigned_email || '—';
+            document.getElementById('viewStoreInfo').textContent = ticket.store_name ? 
+                `${ticket.store_name}${ticket.store_location ? ' - ' + ticket.store_location : ''}` : '—';
+
+            document.getElementById('viewSaleRef').textContent = ticket.sale_ref || '—';
+            document.getElementById('viewTags').textContent = ticket.tags || '—';
+            document.getElementById('viewFeedbackScore').textContent = ticket.feedback_score;
+
+            document.getElementById('viewCreatedAt').textContent = ticket.created_at;
+            document.getElementById('viewFirstResponse').textContent = ticket.first_response_at;
+            document.getElementById('viewUpdatedAt').textContent = ticket.updated_at;
+
+            document.getElementById('viewDescription').textContent = ticket.description;
+            document.getElementById('viewInternalNotes').textContent = ticket.internal_notes || 'No internal notes';
+        }
+
+        function openViewModal() {
+            document.getElementById('viewTicketModal').classList.add('active');
+        }
+
+        function closeViewModal() {
+            document.getElementById('viewTicketModal').classList.remove('active');
+        }
+
+        function editCurrentTicket() {
+            const ticketId = document.getElementById('viewTicketId').textContent;
+            closeViewModal();
+            updateTicket(ticketId);
+        }
+
+        function startRealtimeUpdates() {
+            realtimeInterval = setInterval(checkForUpdates, 5000);
+            document.getElementById('realtimeIndicator').style.display = 'flex';
+        }
+
+        function stopRealtimeUpdates() {
+            if (realtimeInterval) {
+                clearInterval(realtimeInterval);
+                realtimeInterval = null;
+            }
+            document.getElementById('realtimeIndicator').style.display = 'none';
+        }
+
+        async function checkForUpdates() {
+            try {
+                const response = await fetch(`?action=get_ticket_updates&last_update=${encodeURIComponent(lastUpdateTime)}`);
+                const data = await response.json();
+                
+                if (data.updated) {
+                    lastUpdateTime = '<?php echo date('Y-m-d H:i:s'); ?>';
+                    
+                    if (data.stats) {
+                        updateStats(data.stats);
+                    }
+                    
+                    if (data.tickets.length > 0) {
+                        showUpdateNotification(data.tickets.length);
+                        refreshTickets();
+                    }
+                }
+            } catch (error) {
+                console.error('Error checking for updates:', error);
+            }
+        }
+
+        function updateStats(stats) {
+            const statCards = document.querySelectorAll('.stat-card');
+            if (statCards.length >= 6) {
+                statCards[0].querySelector('.stat-value').textContent = numberFormat(stats.totalTickets);
+                statCards[1].querySelector('.stat-value').textContent = numberFormat(stats.openTickets);
+                statCards[2].querySelector('.stat-value').textContent = numberFormat(stats.inProgress);
+                statCards[3].querySelector('.stat-value').textContent = numberFormat(stats.resolved);
+                statCards[4].querySelector('.stat-value').textContent = stats.avgResponseHours ? stats.avgResponseHours + ' hrs' : 'N/A';
+                statCards[5].querySelector('.stat-value').textContent = stats.satisfactionRate ? stats.satisfactionRate + '%' : 'N/A';
+            }
+        }
+
+        function showUpdateNotification(count) {
+            const notification = document.createElement('div');
+            notification.className = 'update-notification';
+            notification.innerHTML = `
+                <div style="padding: 12px; background: #10b981; color: white; border-radius: 6px; margin-bottom: 10px; font-size: 14px;">
+                    🔄 ${count} ticket${count > 1 ? 's' : ''} updated. <a href="javascript:void(0)" onclick="refreshTickets()" style="color: white; text-decoration: underline;">Refresh</a>
+                </div>
+            `;
+            
+            const container = document.querySelector('.container');
+            container.insertBefore(notification, container.firstChild);
+            
+            setTimeout(() => {
+                notification.remove();
+            }, 5000);
+        }
+
+        async function applyFilters() {
+            const filters = {
+                status: document.getElementById('statusFilter').value,
+                priority: document.getElementById('priorityFilter').value,
+                category: document.getElementById('categoryFilter').value,
+                date_range: document.getElementById('dateFilter').value,
+                search: document.getElementById('globalSearch').value
+            };
+            
+            currentFilters = filters;
+            
+            try {
+                const params = new URLSearchParams({
+                    action: 'filter_tickets',
+                    ...filters
+                });
+                
+                const response = await fetch(`?${params}`);
+                const data = await response.json();
+                
+                if (!data.error) {
+                    updateTicketsTable(data.tickets, data.total_count);
+                } else {
+                    showError('Error applying filters: ' + data.error);
+                }
+            } catch (error) {
+                showError('Error applying filters: ' + error.message);
+            }
+        }
+
+        function updateTicketsTable(tickets, totalCount) {
+            const tbody = document.getElementById('ticketsTableBody');
+            const ticketCount = document.getElementById('ticketCount');
+            const totalTicketsCount = document.getElementById('totalTicketsCount');
+            const showingRange = document.getElementById('showingRange');
+            
+            ticketCount.textContent = totalCount;
+            totalTicketsCount.textContent = totalCount;
+            const showingEnd = Math.min(itemsPerPage, tickets.length);
+            showingRange.innerHTML = `<strong>1-${showingEnd}</strong>`;
+            
+            tbody.innerHTML = '';
+            
+            tickets.forEach(ticket => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td><input type="checkbox"></td>
+                    <td><span class="contact-id">${ticket.id}</span></td>
+                    <td>
+                        <div class="contact-name-cell">
+                            <div class="contact-avatar">${ticket.customer_initials}</div>
+                            <div class="contact-name-info">
+                                <div class="contact-name-primary">${ticket.customer}</div>
+                            </div>
+                        </div>
+                    </td>
+                    <td>
+                        <div class="ticket-subject">
+                            <div class="ticket-subject-title">${ticket.subject}</div>
+                            <div class="ticket-subject-desc">${ticket.description}</div>
+                            ${ticket.sale_ref !== '-' ? `<div class="ticket-sale-ref">🔗 ${ticket.sale_ref}</div>` : ''}
+                        </div>
+                    </td>
+                    <td><span class="category-badge category-${ticket.category.toLowerCase().replace(' ', '-')}">${ticket.category}</span></td>
+                    <td><span class="priority-badge priority-${ticket.priority.toLowerCase()}">${ticket.priority}</span></td>
+                    <td><span class="status-badge ticket-status-${ticket.status.toLowerCase().replace(' ', '-')}">${ticket.status.toUpperCase()}</span></td>
+                    <td>
+                        <div class="contact-name-cell">
+                            <div class="contact-avatar" style="width: 32px; height: 32px; font-size: 12px;">${ticket.assigned_initials}</div>
+                            <span>${ticket.assigned}</span>
+                        </div>
+                    </td>
+                    <td>${ticket.created}</td>
+                    <td>${ticket.updated}</td>
+                    <td>
+                        <div class="action-buttons">
+                            <button class="action-btn" onclick="viewTicket('${ticket.id}')">View</button>
+                            <button class="action-btn" onclick="updateTicket('${ticket.id}')">Update</button>
+                        </div>
+                    </td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        function resetFilters() {
+            document.getElementById('statusFilter').value = 'All Status';
+            document.getElementById('priorityFilter').value = 'All Priority';
+            document.getElementById('categoryFilter').value = 'All Categories';
+            document.getElementById('dateFilter').value = 'All Time';
+            document.getElementById('globalSearch').value = '';
+            
+            applyFilters();
+        }
+
+        function refreshTickets() {
+            applyFilters();
+            lastUpdateTime = '<?php echo date('Y-m-d H:i:s'); ?>';
+        }
+
+        function generateReports() {
+            const filters = currentFilters;
+            const reportUrl = `reportsManagement.php?source=support&status=${filters.status}&priority=${filters.priority}&category=${filters.category}&date_range=${filters.date_range}`;
+            window.open(reportUrl, '_blank');
+        }
+
+        function exportTickets() {
+            const filters = currentFilters;
+            const exportUrl = `?action=export_tickets&status=${filters.status}&priority=${filters.priority}&category=${filters.category}&date_range=${filters.date_range}&search=${filters.search}`;
+            window.location.href = exportUrl;
+        }
+
+        function numberFormat(number) {
+            return new Intl.NumberFormat().format(number);
+        }
+
+        function showError(message) {
+            const errorDiv = document.createElement('div');
+            errorDiv.className = 'update-notification';
+            errorDiv.innerHTML = `
+                <div style="padding: 12px; background: #ef4444; color: white; border-radius: 6px; margin-bottom: 10px; font-size: 14px;">
+                    ❌ ${message}
+                </div>
+            `;
+            
+            const container = document.querySelector('.container');
+            container.insertBefore(errorDiv, container.firstChild);
+            
+            setTimeout(() => {
+                errorDiv.remove();
+            }, 5000);
+        }
+
+        function showSuccess(message) {
+            const successDiv = document.createElement('div');
+            successDiv.className = 'update-notification';
+            successDiv.innerHTML = `
+                <div style="padding: 12px; background: #10b981; color: white; border-radius: 6px; margin-bottom: 10px; font-size: 14px;">
+                    ✅ ${message}
+                </div>
+            `;
+            
+            const container = document.querySelector('.container');
+            container.insertBefore(successDiv, container.firstChild);
+            
+            setTimeout(() => {
+                successDiv.remove();
+            }, 5000);
+        }
+
         function openTicketModal() {
             document.getElementById('ticketModal').classList.add('active');
+            document.getElementById('customerEmail').value = '';
+            document.getElementById('customerPhone').value = '';
         }
 
         function closeTicketModal() {
@@ -618,84 +1756,212 @@
             document.getElementById('ticketForm').reset();
         }
 
-        function saveTicket() {
+        function openUpdateModal(ticketId) {
+            document.getElementById('updateTicketId').value = ticketId;
+            document.getElementById('updateTicketModal').classList.add('active');
+        }
+
+        function closeUpdateModal() {
+            document.getElementById('updateTicketModal').classList.remove('active');
+            document.getElementById('updateTicketForm').reset();
+        }
+
+        async function saveTicket() {
             const form = document.getElementById('ticketForm');
-            if (form.checkValidity()) {
-                alert('Support ticket created successfully!');
-                closeTicketModal();
-                // Here you would send data to PHP backend
-                // PHP will validate user role (can_create_support_tickets)
-                // Insert into SupportTickets table
-            } else {
+            const submitBtn = document.getElementById('createTicketBtn');
+            
+            if (!form.checkValidity()) {
                 form.reportValidity();
+                return;
             }
-        }
 
-        // Close modal on overlay click
-        document.getElementById('ticketModal').addEventListener('click', function(e) {
-            if (e.target === this) {
-                closeTicketModal();
-            }
-        });
+            submitBtn.classList.add('btn-loading');
+            submitBtn.disabled = true;
 
-        // Search functionality
-        const searchBox = document.querySelector('.search-box');
-        searchBox.addEventListener('input', function(e) {
-            console.log('Searching for:', e.target.value);
-        });
+            const formData = new FormData(form);
+            formData.append('action', 'create_ticket');
 
-        // Select all checkbox
-        const selectAll = document.querySelector('.table thead input[type="checkbox"]');
-        const rowCheckboxes = document.querySelectorAll('.table tbody input[type="checkbox"]');
-
-        if (selectAll) {
-            selectAll.addEventListener('change', function() {
-                rowCheckboxes.forEach(checkbox => {
-                    checkbox.checked = this.checked;
+            try {
+                const response = await fetch('', {
+                    method: 'POST',
+                    body: formData
                 });
-            });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showSuccess(result.message);
+                    closeTicketModal();
+                    refreshTickets();
+                    lastUpdateTime = '<?php echo date('Y-m-d H:i:s'); ?>';
+                } else {
+                    showError('Error: ' + result.message);
+                }
+            } catch (error) {
+                showError('Error creating ticket: ' + error.message);
+            } finally {
+                submitBtn.classList.remove('btn-loading');
+                submitBtn.disabled = false;
+            }
         }
 
-        // Pagination
-        document.querySelectorAll('.pagination button').forEach(btn => {
-            btn.addEventListener('click', function() {
-                if (this.textContent !== '‹' && this.textContent !== '›') {
-                    document.querySelectorAll('.pagination button').forEach(b => b.classList.remove('active'));
-                    this.classList.add('active');
-                }
-            });
-        });
+        async function submitTicketUpdate() {
+            const form = document.getElementById('updateTicketForm');
+            const submitBtn = document.getElementById('updateTicketBtn');
+            const formData = new FormData(form);
+            formData.append('action', 'update_ticket_status');
 
-        // Filter change listeners
-        document.querySelectorAll('.filter-select').forEach(select => {
-            select.addEventListener('change', function() {
-                console.log('Filter changed:', this.value);
-            });
-        });
+            submitBtn.classList.add('btn-loading');
+            submitBtn.disabled = true;
 
-        // Table action buttons
-        document.querySelectorAll('.action-btn').forEach(btn => {
-            btn.addEventListener('click', function(e) {
-                e.stopPropagation();
-                const action = this.textContent.trim();
+            try {
+                const response = await fetch('', {
+                    method: 'POST',
+                    body: formData
+                });
                 
-                if (action === 'View') {
-                    alert('View ticket details');
-                } else if (action === 'Update') {
-                    alert('Update ticket status');
+                const result = await response.json();
+                
+                if (result.success) {
+                    showSuccess(result.message);
+                    closeUpdateModal();
+                    refreshTickets();
+                    lastUpdateTime = '<?php echo date('Y-m-d H:i:s'); ?>';
+                } else {
+                    showError('Error: ' + result.message);
                 }
-            });
-        });
+            } catch (error) {
+                showError('Error updating ticket: ' + error.message);
+            } finally {
+                submitBtn.classList.remove('btn-loading');
+                submitBtn.disabled = false;
+            }
+        }
 
-        // Table row clicks
-        document.querySelectorAll('.table tbody tr').forEach(row => {
-            row.addEventListener('click', function(e) {
-                if (!e.target.closest('button') && !e.target.closest('input[type="checkbox"]')) {
-                    const ticketId = this.querySelector('.contact-id').textContent;
-                    alert('Opening ticket: ' + ticketId);
+        function updateTicket(ticketId) {
+            openUpdateModal(ticketId);
+        }
+
+        function changePage(direction) {
+            console.log('Changing page:', direction);
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            document.getElementById('statusFilter').addEventListener('change', applyFilters);
+            document.getElementById('priorityFilter').addEventListener('change', applyFilters);
+            document.getElementById('categoryFilter').addEventListener('change', applyFilters);
+            document.getElementById('dateFilter').addEventListener('change', applyFilters);
+            document.getElementById('globalSearch').addEventListener('input', applyFilters);
+            
+            document.getElementById('createTicketBtn').addEventListener('click', saveTicket);
+            document.getElementById('updateTicketBtn').addEventListener('click', submitTicketUpdate);
+            
+            startRealtimeUpdates();
+            
+            document.getElementById('ticketModal').addEventListener('click', function(e) {
+                if (e.target === this) {
+                    closeTicketModal();
                 }
             });
+
+            document.getElementById('updateTicketModal').addEventListener('click', function(e) {
+                if (e.target === this) {
+                    closeUpdateModal();
+                }
+            });
+
+            document.getElementById('viewTicketModal').addEventListener('click', function(e) {
+                if (e.target === this) {
+                    closeViewModal();
+                }
+            });
+
+            const selectAll = document.getElementById('selectAll');
+            if (selectAll) {
+                selectAll.addEventListener('change', function() {
+                    const rowCheckboxes = document.querySelectorAll('.table tbody input[type="checkbox"]');
+                    rowCheckboxes.forEach(checkbox => {
+                        checkbox.checked = this.checked;
+                    });
+                });
+            }
         });
     </script>
 </body>
 </html>
+
+<?php
+function renderTicketRow($ticket) {
+    $statusClass = match($ticket['status']) {
+        'Open' => 'ticket-status-open',
+        'In Progress' => 'ticket-status-progress',
+        'Resolved' => 'ticket-status-resolved',
+        'Closed' => 'ticket-status-closed',
+        default => 'ticket-status-open'
+    };
+
+    $priorityClass = match($ticket['priority']) {
+        'Critical' => 'ticket-priority-critical',
+        'High' => 'priority-high',
+        'Medium' => 'priority-medium',
+        'Low' => 'priority-low',
+        default => 'priority-medium'
+    };
+
+    $categoryClass = match($ticket['category']) {
+        'Product Issue' => 'category-product',
+        'Order Issue' => 'category-order',
+        'Refund Request' => 'category-refund',
+        'Billing Issue' => 'category-billing',
+        'Technical Support' => 'category-technical',
+        'Account Issue' => 'category-account',
+        'Shipping Issue' => 'category-shipping',
+        'Complaint' => 'category-complaint',
+        'Inquiry' => 'category-inquiry',
+        'Feature Request' => 'category-feature',
+        default => 'category-inquiry'
+    };
+    
+    ob_start();
+    ?>
+    <tr>
+        <td><input type="checkbox"></td>
+        <td><span class="contact-id"><?php echo $ticket['id']; ?></span></td>
+        <td>
+            <div class="contact-name-cell">
+                <div class="contact-avatar"><?php echo $ticket['customer_initials']; ?></div>
+                <div class="contact-name-info">
+                    <div class="contact-name-primary"><?php echo $ticket['customer']; ?></div>
+                </div>
+            </div>
+        </td>
+        <td>
+            <div class="ticket-subject">
+                <div class="ticket-subject-title"><?php echo $ticket['subject']; ?></div>
+                <div class="ticket-subject-desc"><?php echo $ticket['description']; ?></div>
+                <?php if ($ticket['sale_ref'] !== '-'): ?>
+                    <div class="ticket-sale-ref">🔗 <?php echo $ticket['sale_ref']; ?></div>
+                <?php endif; ?>
+            </div>
+        </td>
+        <td><span class="category-badge <?php echo $categoryClass; ?>"><?php echo $ticket['category']; ?></span></td>
+        <td><span class="priority-badge <?php echo $priorityClass; ?>"><?php echo $ticket['priority']; ?></span></td>
+        <td><span class="status-badge <?php echo $statusClass; ?>"><?php echo strtoupper($ticket['status']); ?></span></td>
+        <td>
+            <div class="contact-name-cell">
+                <div class="contact-avatar" style="width: 32px; height: 32px; font-size: 12px;"><?php echo $ticket['assigned_initials']; ?></div>
+                <span><?php echo $ticket['assigned']; ?></span>
+            </div>
+        </td>
+        <td><?php echo $ticket['created']; ?></td>
+        <td><?php echo $ticket['updated']; ?></td>
+        <td>
+            <div class="action-buttons">
+                <button class="action-btn" onclick="viewTicket('<?php echo $ticket['id']; ?>')">View</button>
+                <button class="action-btn" onclick="updateTicket('<?php echo $ticket['id']; ?>')">Update</button>
+            </div>
+        </td>
+    </tr>
+    <?php
+    return ob_get_clean();
+}
