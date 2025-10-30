@@ -5,7 +5,7 @@ if (session_status() === PHP_SESSION_NONE) {
 $activeTab = $_GET['tab'] ?? 'customers';
 
 // dashboard/index.php
-require_once('../api/crm.php');
+require_once('../../api/crm.php');
 
 // Assuming you already have the user ID from session
 $userId = $_SESSION['user_id'] ?? null;

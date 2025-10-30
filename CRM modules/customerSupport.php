@@ -1,6 +1,6 @@
 <?php
 // Include the unified backend
-require_once(__DIR__ . '/../api/crm.php');
+require_once('../../api/crm.php');
 
 // Prepare data holders
 $totalTickets = 0;
