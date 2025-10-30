@@ -521,6 +521,26 @@ $stats_dynamic = [
     ['icon'=>'⭐','value'=>($satisfactionRate ? $satisfactionRate . '%' : 'N/A'),'label'=>'Satisfaction Rate','sublabel'=>'Customer feedback','trend'=>'+3.2%','trend_dir'=>'up','color'=>'#ddd6fe']
 ];
 
+// Assuming you already have the user ID from session
+$userId = $_SESSION['user_id'] ?? null;
+
+$userInitials = '';
+
+// Fetch user's first name from the database
+if ($userId) {
+    $stmt = $pdo->prepare("SELECT FirstName FROM users WHERE UserID = ?");
+    $stmt->execute([$userId]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if ($user && !empty($user['FirstName'])) {
+        // Extract initials (first two letters, uppercase)
+        $userInitials = strtoupper(substr($user['FirstName'], 0, 2));
+    } else {
+        $userInitials = 'NA'; // fallback if no name found
+    }
+}
+
+
 ?>
 
 <!DOCTYPE html>
@@ -556,7 +576,7 @@ $stats_dynamic = [
                     🔔
                     <span class="notification-badge">3</span>
                 </button>
-                <a href="./crmProfile.php"><div class="user-avatar">RA</div></a>
+                <a href="./crmProfile.php"><div class="user-avatar"><?php echo htmlspecialchars($userInitials); ?></div></a>
             </div>
         </div>
     </nav>

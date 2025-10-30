@@ -137,6 +137,26 @@ $parts = preg_split('/\s+/', trim($userName));
 $firstName = $parts[0] ?? '';
 $lastName = count($parts) > 1 ? $parts[count($parts)-1] : '';
 
+
+// Assuming you already have the user ID from session
+$userId = $_SESSION['user_id'] ?? null;
+
+$userInitials = '';
+
+// Fetch user's first name from the database
+if ($userId) {
+    $stmt = $pdo->prepare("SELECT FirstName FROM users WHERE UserID = ?");
+    $stmt->execute([$userId]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if ($user && !empty($user['FirstName'])) {
+        // Extract initials (first two letters, uppercase)
+        $userInitials = strtoupper(substr($user['FirstName'], 0, 2));
+    } else {
+        $userInitials = 'NA'; // fallback if no name found
+    }
+}
+
 ?>
 
 <!DOCTYPE html>
@@ -153,7 +173,7 @@ $lastName = count($parts) > 1 ? $parts[count($parts)-1] : '';
         <div class="navbar-inner">
             <div class="brand">
                 <div class="brand-icon">C</div>
-                <span>CRM Enterprise</span>
+                <span>CRM Shoe Retail</span>
             </div>
             <ul class="nav-menu">
                 <li><a href="./CrmDashboard.php">Dashboard</a></li>
@@ -171,7 +191,7 @@ $lastName = count($parts) > 1 ? $parts[count($parts)-1] : '';
                     🔔
                     <span class="notification-badge">5</span>
                 </button>
-                <div class="user-avatar">CS</div>
+                <div class="user-avatar"><?php echo htmlspecialchars($userInitials); ?></div>
             </div>
         </div>
     </nav>
@@ -206,7 +226,7 @@ $lastName = count($parts) > 1 ? $parts[count($parts)-1] : '';
             <div class="content-card">
                 <div style="padding: 32px; text-align: center;">
                     <div style="margin-bottom: 24px;">
-                        <div class="profile-avatar-large">CS</div>
+                        <div class="profile-avatar-large"><?php echo htmlspecialchars($userInitials); ?></div>
                     </div>
                     <h2 style="font-size: 24px; font-weight: 700; color: var(--gray-900); margin-bottom: 4px;"><?php echo htmlspecialchars($userName); ?></h2>
                     <p style="color: var(--gray-600); font-size: 14px; margin-bottom: 8px;"><?php echo htmlspecialchars($userDept ?: $userRole ?: 'Customer Service'); ?></p>

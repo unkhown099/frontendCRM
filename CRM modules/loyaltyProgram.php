@@ -1,442 +1,8 @@
 <?php
-session_start();
+// Include the unified backend
+require_once(__DIR__ . '/../api/crm.php');
 
-// Include DB config and get PDO
-require_once(__DIR__ . '/../config/database.php');
-try {
-    $pdo = Database::getInstance()->getConnection();
-} catch (Exception $e) {
-    die('Database connection error: ' . $e->getMessage());
-}
-
-// Simple auth redirect
-if (!isset($_SESSION['user_id'])) {
-    header('Location: ../login.php');
-    exit();
-}
-
-// Helper function to check if table exists
-function tableExists($pdo, $tableName) {
-    try {
-        $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
-        $stmt->execute([$tableName]);
-        return $stmt->fetchColumn() > 0;
-    } catch (Exception $e) {
-        return false;
-    }
-}
-
-// Handle AJAX requests for real-time updates
-if (isset($_GET['action']) && $_GET['action'] === 'get_report_updates') {
-    header('Content-Type: application/json');
-    
-    $range = $_GET['range'] ?? 'this_month';
-    list($startDate, $endDate) = getDateRange($range);
-    
-    $response = ['updated' => true, 'stats' => [], 'charts' => []];
-    
-    try {
-        // Get updated stats
-        $stats = getReportStats($pdo, $startDate, $endDate);
-        $response['stats'] = $stats;
-        
-        // Get updated charts data
-        $charts = getChartsData($pdo, $startDate, $endDate);
-        $response['charts'] = $charts;
-        
-    } catch (Exception $e) {
-        $response['error'] = $e->getMessage();
-    }
-    
-    echo json_encode($response);
-    exit();
-}
-
-// Handle export requests
-if (isset($_GET['action']) && $_GET['action'] === 'export_report') {
-    $reportType = $_GET['type'] ?? 'sales';
-    $range = $_GET['range'] ?? 'this_month';
-    list($startDate, $endDate) = getDateRange($range);
-    
-    header('Content-Type: text/csv');
-    header('Content-Disposition: attachment; filename="' . $reportType . '_report_' . date('Y-m-d') . '.csv"');
-    
-    $output = fopen('php://output', 'w');
-    
-    try {
-        if ($reportType === 'sales') {
-            fputcsv($output, ['Sale ID', 'Date', 'Customer', 'Amount', 'Tax', 'Discount', 'Payment Method', 'Status']);
-            
-            $stmt = $pdo->prepare("
-                SELECT s.SaleID, s.SaleDate, CONCAT(c.FirstName, ' ', c.LastName) as Customer, 
-                       s.TotalAmount, s.TaxAmount, s.DiscountAmount, s.PaymentMethod, s.PaymentStatus
-                FROM sales s
-                LEFT JOIN customers c ON s.CustomerID = c.CustomerID
-                WHERE s.SaleDate BETWEEN ? AND ?
-                ORDER BY s.SaleDate DESC
-            ");
-            $stmt->execute([$startDate, $endDate]);
-            
-            while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-                fputcsv($output, $row);
-            }
-        } elseif ($reportType === 'revenue') {
-            fputcsv($output, ['Month', 'Revenue', 'Orders', 'Avg Order Value']);
-            
-            $year = date('Y');
-            $stmt = $pdo->prepare("
-                SELECT MONTH(SaleDate) as Month, 
-                       SUM(TotalAmount) as Revenue,
-                       COUNT(*) as Orders,
-                       AVG(TotalAmount) as AvgOrderValue
-                FROM sales 
-                WHERE YEAR(SaleDate) = ?
-                GROUP BY MONTH(SaleDate)
-                ORDER BY MONTH(SaleDate)
-            ");
-            $stmt->execute([$year]);
-            
-            while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-                $row['Month'] = date('F', mktime(0, 0, 0, $row['Month'], 1));
-                fputcsv($output, $row);
-            }
-        }
-    } catch (Exception $e) {
-        fputcsv($output, ['Error', $e->getMessage()]);
-    }
-    
-    fclose($output);
-    exit();
-}
-
-// Handle generate report request
-if (isset($_POST['action']) && $_POST['action'] === 'generate_report') {
-    $reportType = $_POST['report_type'] ?? 'sales_summary';
-    $range = $_POST['range'] ?? 'this_month';
-    $format = $_POST['format'] ?? 'html';
-    
-    list($startDate, $endDate) = getDateRange($range);
-    
-    try {
-        $reportData = generateCustomReport($pdo, $reportType, $startDate, $endDate);
-        
-        if ($format === 'csv') {
-            header('Content-Type: text/csv');
-            header('Content-Disposition: attachment; filename="custom_report_' . date('Y-m-d') . '.csv"');
-            
-            $output = fopen('php://output', 'w');
-            
-            if (!empty($reportData['headers'])) {
-                fputcsv($output, $reportData['headers']);
-            }
-            
-            foreach ($reportData['rows'] as $row) {
-                fputcsv($output, $row);
-            }
-            
-            fclose($output);
-            exit();
-        } else {
-            // For HTML format, we'll just redirect back with a success message
-            $_SESSION['report_message'] = "Report generated successfully for " . date('M d, Y', strtotime($startDate)) . " to " . date('M d, Y', strtotime($endDate));
-            header('Location: ' . $_SERVER['PHP_SELF'] . '?range=' . $range);
-            exit();
-        }
-    } catch (Exception $e) {
-        $_SESSION['report_error'] = "Error generating report: " . $e->getMessage();
-        header('Location: ' . $_SERVER['PHP_SELF']);
-        exit();
-    }
-}
-
-// Helper: parse requested range
-function getDateRange($range) {
-    $now = new DateTime();
-    switch ($range) {
-        case 'last_month':
-            $start = (new DateTime('first day of last month'))->setTime(0,0,0);
-            $end = (new DateTime('last day of last month'))->setTime(23,59,59);
-            break;
-        case 'this_quarter':
-            $quarter = ceil($now->format('n')/3);
-            $start = new DateTime(($quarter*3-2) . '/1/' . $now->format('Y'));
-            $end = (clone $start)->modify('+2 months')->modify('last day of')->setTime(23,59,59);
-            break;
-        case 'last_quarter':
-            $quarter = ceil($now->format('n')/3) - 1;
-            if ($quarter < 1) { $quarter = 4; $year = $now->format('Y') - 1; } else { $year = $now->format('Y'); }
-            $start = new DateTime((($quarter*3-2) . '/1/' . $year));
-            $end = (clone $start)->modify('+2 months')->modify('last day of')->setTime(23,59,59);
-            break;
-        case 'this_year':
-            $start = new DateTime($now->format('Y') . '-01-01');
-            $end = (new DateTime($now->format('Y') . '-12-31'))->setTime(23,59,59);
-            break;
-        case 'custom':
-            if (!empty($_GET['start']) && !empty($_GET['end'])) {
-                $start = new DateTime($_GET['start']); $start->setTime(0,0,0);
-                $end = new DateTime($_GET['end']); $end->setTime(23,59,59);
-                break;
-            }
-        case 'this_month':
-        default:
-            $start = (new DateTime('first day of this month'))->setTime(0,0,0);
-            $end = (new DateTime('last day of this month'))->setTime(23,59,59);
-            break;
-    }
-    return [$start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s')];
-}
-
-// Function to get report statistics
-function getReportStats($pdo, $startDate, $endDate) {
-    $stats = [];
-    
-    // Total Revenue
-    try {
-        $stmt = $pdo->prepare("SELECT IFNULL(SUM(TotalAmount),0) AS total FROM sales WHERE SaleDate BETWEEN ? AND ?");
-        $stmt->execute([$startDate, $endDate]);
-        $stats['totalRevenue'] = (float)$stmt->fetchColumn();
-    } catch (Exception $e) {
-        $stats['totalRevenue'] = 0;
-    }
-
-    // Orders Closed
-    try {
-        $stmt = $pdo->prepare("SELECT COUNT(*) FROM sales WHERE SaleDate BETWEEN ? AND ?");
-        $stmt->execute([$startDate, $endDate]);
-        $stats['ordersClosed'] = (int)$stmt->fetchColumn();
-    } catch (Exception $e) {
-        $stats['ordersClosed'] = 0;
-    }
-
-    // Avg Order Value
-    $stats['avgOrderValue'] = $stats['ordersClosed'] > 0 ? ($stats['totalRevenue'] / $stats['ordersClosed']) : 0;
-
-    // Avg items per order
-    try {
-        $stmt = $pdo->prepare("SELECT AVG(item_count) FROM (SELECT COUNT(*) AS item_count FROM saledetails sd JOIN sales s ON sd.SaleID = s.SaleID WHERE s.SaleDate BETWEEN ? AND ? GROUP BY sd.SaleID) t");
-        $stmt->execute([$startDate, $endDate]);
-        $stats['avgItemsPerOrder'] = round($stmt->fetchColumn() ?: 0, 1);
-    } catch (Exception $e) {
-        $stats['avgItemsPerOrder'] = 0;
-    }
-
-    // Avg sales cycle
-    try {
-        $stmt = $pdo->prepare("SELECT AVG(DATEDIFF(s.SaleDate, c.CreatedAt)) FROM sales s JOIN customers c ON s.CustomerID = c.CustomerID WHERE s.SaleDate BETWEEN ? AND ? AND c.CreatedAt IS NOT NULL");
-        $stmt->execute([$startDate, $endDate]);
-        $stats['avgSalesCycleDays'] = (int)round($stmt->fetchColumn() ?: 0);
-    } catch (Exception $e) {
-        $stats['avgSalesCycleDays'] = 0;
-    }
-
-    // New customers in period
-    try {
-        $stmt = $pdo->prepare("SELECT COUNT(*) FROM customers WHERE CreatedAt BETWEEN ? AND ?");
-        $stmt->execute([$startDate, $endDate]);
-        $stats['newCustomers'] = (int)$stmt->fetchColumn();
-    } catch (Exception $e) {
-        $stats['newCustomers'] = 0;
-    }
-
-    // Customer satisfaction (try different possible ticket tables)
-    $stats['satisfactionRate'] = 0;
-    $possibleTicketTables = ['supporttickets', 'tickets', 'customer_support', 'helpdesk_tickets'];
-    
-    foreach ($possibleTicketTables as $table) {
-        if (tableExists($pdo, $table)) {
-            try {
-                $stmt = $pdo->prepare("SELECT AVG(FeedbackScore) FROM `{$table}` WHERE CreatedAt BETWEEN ? AND ? AND FeedbackScore IS NOT NULL");
-                $stmt->execute([$startDate, $endDate]);
-                $avgScore = $stmt->fetchColumn();
-                if ($avgScore) {
-                    $stats['satisfactionRate'] = round(($avgScore / 5) * 100, 1); // Convert 0-5 to percentage
-                    break;
-                }
-            } catch (Exception $e) {
-                // Continue to next table
-                continue;
-            }
-        }
-    }
-    
-    // If no satisfaction data found, use a calculated value based on payment status
-    if ($stats['satisfactionRate'] == 0) {
-        try {
-            $stmt = $pdo->prepare("SELECT 
-                SUM(CASE WHEN PaymentStatus = 'Paid' THEN 1 ELSE 0 END) as paid_count,
-                COUNT(*) as total_count 
-                FROM sales WHERE SaleDate BETWEEN ? AND ?");
-            $stmt->execute([$startDate, $endDate]);
-            $result = $stmt->fetch(PDO::FETCH_ASSOC);
-            if ($result && $result['total_count'] > 0) {
-                $stats['satisfactionRate'] = round(($result['paid_count'] / $result['total_count']) * 100, 1);
-            }
-        } catch (Exception $e) {
-            $stats['satisfactionRate'] = 85.0; // Default value
-        }
-    }
-    
-    return $stats;
-}
-
-// Function to get charts data
-function getChartsData($pdo, $startDate, $endDate) {
-    // Monthly revenue for the selected period
-    $monthlyValues = [];
-    $paidPercentages = [];
-    $monthsLabels = [];
-    
-    try {
-        // Get all months in the range
-        $start = new DateTime($startDate);
-        $end = new DateTime($endDate);
-        $interval = DateInterval::createFromDateString('1 month');
-        $period = new DatePeriod($start, $interval, $end);
-        
-        foreach ($period as $dt) {
-            $month = $dt->format('Y-m');
-            $monthsLabels[] = $dt->format('M Y');
-            
-            // Get revenue for this month
-            $monthStart = $dt->format('Y-m-01 00:00:00');
-            $monthEnd = $dt->format('Y-m-t 23:59:59');
-            
-            $stmt = $pdo->prepare("SELECT IFNULL(SUM(TotalAmount),0) AS total FROM sales WHERE SaleDate BETWEEN ? AND ?");
-            $stmt->execute([$monthStart, $monthEnd]);
-            $monthlyValues[] = (float)$stmt->fetchColumn();
-            
-            // Get payment success rate for this month
-            $stmt = $pdo->prepare("SELECT 
-                SUM(CASE WHEN PaymentStatus = 'Paid' THEN 1 ELSE 0 END) as paid_count,
-                COUNT(*) as total_count 
-                FROM sales WHERE SaleDate BETWEEN ? AND ?");
-            $stmt->execute([$monthStart, $monthEnd]);
-            $result = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if ($result && $result['total_count'] > 0) {
-                $paidPercentages[] = round(($result['paid_count'] / $result['total_count']) * 100, 1);
-            } else {
-                $paidPercentages[] = 0;
-            }
-        }
-        
-        // If no months in range (same month), just use current month
-        if (empty($monthsLabels)) {
-            $currentMonth = date('M Y');
-            $monthsLabels[] = $currentMonth;
-            
-            $monthStart = date('Y-m-01 00:00:00');
-            $monthEnd = date('Y-m-t 23:59:59');
-            
-            $stmt = $pdo->prepare("SELECT IFNULL(SUM(TotalAmount),0) AS total FROM sales WHERE SaleDate BETWEEN ? AND ?");
-            $stmt->execute([$monthStart, $monthEnd]);
-            $monthlyValues[] = (float)$stmt->fetchColumn();
-            
-            $stmt = $pdo->prepare("SELECT 
-                SUM(CASE WHEN PaymentStatus = 'Paid' THEN 1 ELSE 0 END) as paid_count,
-                COUNT(*) as total_count 
-                FROM sales WHERE SaleDate BETWEEN ? AND ?");
-            $stmt->execute([$monthStart, $monthEnd]);
-            $result = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if ($result && $result['total_count'] > 0) {
-                $paidPercentages[] = round(($result['paid_count'] / $result['total_count']) * 100, 1);
-            } else {
-                $paidPercentages[] = 0;
-            }
-        }
-    } catch (Exception $e) {
-        // Use default data if there's an error
-        $monthsLabels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun'];
-        $monthlyValues = [12000, 19000, 15000, 18000, 22000, 25000];
-        $paidPercentages = [85, 90, 88, 92, 87, 94];
-    }
-    
-    return [
-        'monthsLabels' => $monthsLabels,
-        'monthlyValues' => $monthlyValues,
-        'paidPercentages' => $paidPercentages
-    ];
-}
-
-// Function to generate custom reports
-function generateCustomReport($pdo, $reportType, $startDate, $endDate) {
-    $reportData = ['headers' => [], 'rows' => []];
-    
-    switch ($reportType) {
-        case 'sales_summary':
-            $reportData['headers'] = ['Period', 'Total Revenue', 'Orders', 'Avg Order Value', 'New Customers'];
-            
-            $stmt = $pdo->prepare("
-                SELECT 
-                    COUNT(*) as orders,
-                    IFNULL(SUM(TotalAmount),0) as revenue,
-                    IFNULL(AVG(TotalAmount),0) as avg_order_value
-                FROM sales 
-                WHERE SaleDate BETWEEN ? AND ?
-            ");
-            $stmt->execute([$startDate, $endDate]);
-            $salesData = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            $stmt = $pdo->prepare("SELECT COUNT(*) as new_customers FROM customers WHERE CreatedAt BETWEEN ? AND ?");
-            $stmt->execute([$startDate, $endDate]);
-            $customerData = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            $reportData['rows'][] = [
-                date('M d, Y', strtotime($startDate)) . ' to ' . date('M d, Y', strtotime($endDate)),
-                number_format($salesData['revenue'], 2),
-                $salesData['orders'],
-                number_format($salesData['avg_order_value'], 2),
-                $customerData['new_customers']
-            ];
-            break;
-            
-        case 'product_performance':
-            $reportData['headers'] = ['Product', 'SKU', 'Units Sold', 'Revenue', 'Avg Price'];
-            
-            $stmt = $pdo->prepare("
-                SELECT 
-                    p.Brand, p.Model, p.SKU,
-                    SUM(sd.Quantity) as units_sold,
-                    SUM(sd.Subtotal) as revenue,
-                    AVG(sd.UnitPrice) as avg_price
-                FROM saledetails sd
-                JOIN products p ON sd.ProductID = p.ProductID
-                JOIN sales s ON sd.SaleID = s.SaleID
-                WHERE s.SaleDate BETWEEN ? AND ?
-                GROUP BY p.ProductID
-                ORDER BY revenue DESC
-            ");
-            $stmt->execute([$startDate, $endDate]);
-            $reportData['rows'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            break;
-            
-        case 'customer_analysis':
-            $reportData['headers'] = ['Customer', 'Email', 'Total Orders', 'Total Spent', 'Last Purchase'];
-            
-            $stmt = $pdo->prepare("
-                SELECT 
-                    CONCAT(c.FirstName, ' ', c.LastName) as customer,
-                    c.Email,
-                    COUNT(s.SaleID) as total_orders,
-                    SUM(s.TotalAmount) as total_spent,
-                    MAX(s.SaleDate) as last_purchase
-                FROM customers c
-                LEFT JOIN sales s ON c.CustomerID = s.CustomerID
-                WHERE s.SaleDate BETWEEN ? AND ?
-                GROUP BY c.CustomerID
-                ORDER BY total_spent DESC
-            ");
-            $stmt->execute([$startDate, $endDate]);
-            $reportData['rows'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            break;
-    }
-    
-    return $reportData;
-}
-
-// Get initial data
+// Get initial data for Reports & Analytics
 $range = $_GET['range'] ?? 'this_month';
 list($startDate, $endDate) = getDateRange($range);
 
@@ -478,18 +44,36 @@ try {
 
 // Prepare stats array for UI
 $stats_dynamic = [
-    ['icon'=>'💰','value'=>'₱' . number_format($totalRevenue, 2),'label'=>'Total Revenue','sublabel'=>'Period: ' . date('M d', strtotime($startDate)) . ' - ' . date('M d', strtotime($endDate)),'trend'=>'+12.5%','trend_dir'=>'up','color'=>'#d1fae5'],
-    ['icon'=>'📈','value'=>number_format($ordersClosed),'label'=>'Orders Closed','sublabel'=>'Completed orders','trend'=>'+8.2%','trend_dir'=>'up','color'=>'#dbeafe'],
-    ['icon'=>'🎯','value'=>'₱' . number_format($avgOrderValue, 2),'label'=>'Avg Order Value','sublabel'=>'Average per order','trend'=>'+5.1%','trend_dir'=>'up','color'=>'#fef3c7'],
-    ['icon'=>'⏱️','value'=>($avgSalesCycleDays ? $avgSalesCycleDays . ' days' : 'N/A'),'label'=>'Avg Sales Cycle','sublabel'=>'Customer to sale','trend'=>'-2.3%','trend_dir'=>'down','color'=>'#e9d5ff'],
-    ['icon'=>'👥','value'=>number_format($newCustomers),'label'=>'New Customers','sublabel'=>'Acquired in period','trend'=>'+15.7%','trend_dir'=>'up','color'=>'#fee2e2'],
-    ['icon'=>'⭐','value'=>($satisfactionRate ? $satisfactionRate . '%' : 'N/A'),'label'=>'Satisfaction Rate','sublabel'=>'Customer feedback','trend'=>'+3.2%','trend_dir'=>'up','color'=>'#ddd6fe']
+    ['icon' => '💰', 'value' => '₱' . number_format($totalRevenue, 2), 'label' => 'Total Revenue', 'sublabel' => 'Period: ' . date('M d', strtotime($startDate)) . ' - ' . date('M d', strtotime($endDate)), 'trend' => '+12.5%', 'trend_dir' => 'up', 'color' => '#d1fae5'],
+    ['icon' => '📈', 'value' => number_format($ordersClosed), 'label' => 'Orders Closed', 'sublabel' => 'Completed orders', 'trend' => '+8.2%', 'trend_dir' => 'up', 'color' => '#dbeafe'],
+    ['icon' => '🎯', 'value' => '₱' . number_format($avgOrderValue, 2), 'label' => 'Avg Order Value', 'sublabel' => 'Average per order', 'trend' => '+5.1%', 'trend_dir' => 'up', 'color' => '#fef3c7'],
+    ['icon' => '⏱️', 'value' => ($avgSalesCycleDays ? $avgSalesCycleDays . ' days' : 'N/A'), 'label' => 'Avg Sales Cycle', 'sublabel' => 'Customer to sale', 'trend' => '-2.3%', 'trend_dir' => 'down', 'color' => '#e9d5ff'],
+    ['icon' => '👥', 'value' => number_format($newCustomers), 'label' => 'New Customers', 'sublabel' => 'Acquired in period', 'trend' => '+15.7%', 'trend_dir' => 'up', 'color' => '#fee2e2'],
+    ['icon' => '⭐', 'value' => ($satisfactionRate ? $satisfactionRate . '%' : 'N/A'), 'label' => 'Satisfaction Rate', 'sublabel' => 'Customer feedback', 'trend' => '+3.2%', 'trend_dir' => 'up', 'color' => '#ddd6fe']
 ];
+// Assuming you already have the user ID from session
+$userId = $_SESSION['user_id'] ?? null;
 
+$userInitials = '';
+
+// Fetch user's first name from the database
+if ($userId) {
+    $stmt = $db->prepare("SELECT FirstName FROM users WHERE UserID = ?");
+    $stmt->execute([$userId]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if ($user && !empty($user['FirstName'])) {
+        // Extract initials (first two letters, uppercase)
+        $userInitials = strtoupper(substr($user['FirstName'], 0, 2));
+    } else {
+        $userInitials = 'NA'; // fallback if no name found
+    }
+}
 ?>
 
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -498,19 +82,20 @@ $stats_dynamic = [
     <link rel="stylesheet" href="./styles/crmGlobalStyles.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
+
 <body>
     <nav class="navbar">
         <div class="navbar-inner">
             <div class="brand">
                 <div class="brand-icon">C</div>
-                <span>CRM Enterprise</span>
+                <span>CRM Shoe Retail</span>
             </div>
             <ul class="nav-menu">
                 <li><a href="./CrmDashboard.php">Dashboard</a></li>
                 <li><a href="./customerProfile.php">Customer Profiles</a></li>
-                <li><a href="./loyaltyProgram.php">Loyalty Program</a></li>
+                <li><a href="./loyaltyProgram.php" class="active">Loyalty Program</a></li>
                 <li><a href="./customerSupport.php">Customer Support</a></li>
-                <li><a href="./reportsManagement.php" class="active">Reports & Analytics</a></li>
+                <li><a href="./reportsManagement.php">Reports & Analytics</a></li>
             </ul>
             <div class="nav-right">
                 <div class="search-wrapper">
@@ -521,7 +106,9 @@ $stats_dynamic = [
                     🔔
                     <span class="notification-badge">3</span>
                 </button>
-                <a href="./crmProfile.php"><div class="user-avatar">RA</div></a>
+                <a href="./crmProfile.php">
+                    <div class="user-avatar"><?php echo htmlspecialchars($userInitials); ?></div>
+                </a>
             </div>
         </div>
     </nav>
@@ -562,13 +149,15 @@ $stats_dynamic = [
         <!-- Success/Error Messages -->
         <?php if (isset($_SESSION['report_message'])): ?>
             <div class="alert alert-success">
-                <?php echo $_SESSION['report_message']; unset($_SESSION['report_message']); ?>
+                <?php echo $_SESSION['report_message'];
+                unset($_SESSION['report_message']); ?>
             </div>
         <?php endif; ?>
-        
+
         <?php if (isset($_SESSION['report_error'])): ?>
             <div class="alert alert-error">
-                <?php echo $_SESSION['report_error']; unset($_SESSION['report_error']); ?>
+                <?php echo $_SESSION['report_error'];
+                unset($_SESSION['report_error']); ?>
             </div>
         <?php endif; ?>
 
@@ -582,11 +171,11 @@ $stats_dynamic = [
                 <div class="filter-group">
                     <label class="filter-label">Report Period</label>
                     <select class="filter-select" id="dateRange" onchange="applyDateRange()">
-                        <option value="this_month" <?php if($range=='this_month') echo 'selected';?>>This Month</option>
-                        <option value="last_month" <?php if($range=='last_month') echo 'selected';?>>Last Month</option>
-                        <option value="this_quarter" <?php if($range=='this_quarter') echo 'selected';?>>This Quarter</option>
-                        <option value="last_quarter" <?php if($range=='last_quarter') echo 'selected';?>>Last Quarter</option>
-                        <option value="this_year" <?php if($range=='this_year') echo 'selected';?>>This Year</option>
+                        <option value="this_month" <?php if ($range == 'this_month') echo 'selected'; ?>>This Month</option>
+                        <option value="last_month" <?php if ($range == 'last_month') echo 'selected'; ?>>Last Month</option>
+                        <option value="this_quarter" <?php if ($range == 'this_quarter') echo 'selected'; ?>>This Quarter</option>
+                        <option value="last_quarter" <?php if ($range == 'last_quarter') echo 'selected'; ?>>Last Quarter</option>
+                        <option value="this_year" <?php if ($range == 'this_year') echo 'selected'; ?>>This Year</option>
                         <option value="custom">Custom Range</option>
                     </select>
                 </div>
@@ -634,7 +223,7 @@ $stats_dynamic = [
                     <canvas id="revenueChart"></canvas>
                 </div>
             </div>
-            
+
             <div class="content-card">
                 <div class="card-header">
                     <h2 class="section-title">Payment Success Rate</h2>
@@ -679,10 +268,10 @@ $stats_dynamic = [
                         foreach ($recentReports as $report) {
                             $person = trim(($report['FirstName'] ?? '') . ' ' . ($report['LastName'] ?? '')) ?: '—';
                             $customer = trim(($report['cust_first'] ?? '') . ' ' . ($report['cust_last'] ?? '')) ?: 'Customer';
-                            $customerInitials = implode('', array_map(function($p) { 
-                                return strtoupper(substr($p, 0, 1)); 
+                            $customerInitials = implode('', array_map(function ($p) {
+                                return strtoupper(substr($p, 0, 1));
                             }, array_filter(explode(' ', $customer))));
-                            
+
                             // Determine status badge
                             $statusClass = 'status-completed';
                             $statusText = 'COMPLETED';
@@ -693,7 +282,7 @@ $stats_dynamic = [
                                 $statusClass = 'status-pending';
                                 $statusText = 'PARTIAL';
                             }
-                            
+
                             echo '<tr>';
                             echo '<td><span class="contact-id">#SALE-' . htmlspecialchars($report['SaleID']) . '</span></td>';
                             echo '<td>';
@@ -708,10 +297,10 @@ $stats_dynamic = [
                             echo '<td><span class="amount-value">₱' . number_format($report['TotalAmount'], 2) . '</span></td>';
                             echo '<td>';
                             echo '<div class="contact-name-cell">';
-                            echo '<div class="contact-avatar" style="width: 32px; height: 32px; font-size: 12px;">' . 
-                                 implode('', array_map(function($p) { 
-                                     return strtoupper(substr($p, 0, 1)); 
-                                 }, array_filter(explode(' ', $person)))) . '</div>';
+                            echo '<div class="contact-avatar" style="width: 32px; height: 32px; font-size: 12px;">' .
+                                implode('', array_map(function ($p) {
+                                    return strtoupper(substr($p, 0, 1));
+                                }, array_filter(explode(' ', $person)))) . '</div>';
                             echo '<span>' . htmlspecialchars($person) . '</span>';
                             echo '</div>';
                             echo '</td>';
@@ -753,9 +342,9 @@ $stats_dynamic = [
                 <button class="close-btn" onclick="closeGenerateReportModal()">✕</button>
             </div>
             <div class="modal-body">
-                <form id="generateReportForm" method="POST" action="">
+                <form id="generateReportForm" method="POST" action="crm.php">
                     <input type="hidden" name="action" value="generate_report">
-                    
+
                     <div class="form-grid">
                         <div class="form-group full-width">
                             <label class="form-label">Report Type</label>
@@ -765,7 +354,7 @@ $stats_dynamic = [
                                 <option value="customer_analysis">Customer Analysis</option>
                             </select>
                         </div>
-                        
+
                         <div class="form-group full-width">
                             <label class="form-label">Date Range</label>
                             <select class="filter-select" name="range" required>
@@ -776,7 +365,7 @@ $stats_dynamic = [
                                 <option value="this_year">This Year</option>
                             </select>
                         </div>
-                        
+
                         <div class="form-group full-width">
                             <label class="form-label">Output Format</label>
                             <select class="filter-select" name="format" required>
@@ -943,7 +532,9 @@ $stats_dynamic = [
             font-size: 14px;
         }
 
-        .form-input, .filter-select, .form-textarea {
+        .form-input,
+        .filter-select,
+        .form-textarea {
             width: 100%;
             padding: 8px 12px;
             border: 1px solid #d1d5db;
@@ -952,7 +543,9 @@ $stats_dynamic = [
             transition: border-color 0.2s;
         }
 
-        .form-input:focus, .filter-select:focus, .form-textarea:focus {
+        .form-input:focus,
+        .filter-select:focus,
+        .form-textarea:focus {
             outline: none;
             border-color: #3b82f6;
             box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
@@ -1008,9 +601,9 @@ $stats_dynamic = [
             list-style: none;
             background-color: #fff;
             background-clip: padding-box;
-            border: 1px solid rgba(0,0,0,.15);
+            border: 1px solid rgba(0, 0, 0, .15);
             border-radius: 6px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         }
 
         .dropdown-menu.show {
@@ -1037,25 +630,36 @@ $stats_dynamic = [
         }
 
         @keyframes pulse {
-            0% { transform: scale(0.95); opacity: 0.7; }
-            50% { transform: scale(1.1); opacity: 1; }
-            100% { transform: scale(0.95); opacity: 0.7; }
+            0% {
+                transform: scale(0.95);
+                opacity: 0.7;
+            }
+
+            50% {
+                transform: scale(1.1);
+                opacity: 1;
+            }
+
+            100% {
+                transform: scale(0.95);
+                opacity: 0.7;
+            }
         }
 
         @media (max-width: 768px) {
             .charts-grid {
                 grid-template-columns: 1fr;
             }
-            
+
             .modal {
                 width: 95%;
                 margin: 20px;
             }
-            
+
             .modal-footer {
                 flex-direction: column;
             }
-            
+
             .modal-footer .btn {
                 width: 100%;
             }
@@ -1167,9 +771,9 @@ $stats_dynamic = [
         async function checkForUpdates() {
             try {
                 const range = document.getElementById('dateRange').value;
-                const response = await fetch(`?action=get_report_updates&range=${encodeURIComponent(range)}`);
+                const response = await fetch(`crm.php?action=get_report_updates&range=${encodeURIComponent(range)}`);
                 const data = await response.json();
-                
+
                 if (data.updated && data.stats) {
                     updateStats(data.stats);
                     if (data.charts) {
@@ -1226,12 +830,12 @@ $stats_dynamic = [
         // Export functionality
         function exportReport(type) {
             const range = document.getElementById('dateRange').value;
-            window.location.href = `?action=export_report&type=${type}&range=${range}`;
+            window.location.href = `crm.php?action=export_report&type=${type}&range=${range}`;
         }
 
         function exportChartAsImage(chartType) {
             let chart, filename;
-            
+
             if (chartType === 'revenue' && revenueChart) {
                 chart = revenueChart;
                 filename = 'revenue_chart_' + new Date().toISOString().slice(0, 10);
@@ -1242,7 +846,7 @@ $stats_dynamic = [
                 alert('Chart not available for export');
                 return;
             }
-            
+
             const image = chart.toBase64Image();
             const link = document.createElement('a');
             link.href = image;
@@ -1298,7 +902,7 @@ $stats_dynamic = [
                     menu.classList.toggle('show');
                 });
             }
-            
+
             // Close dropdown when clicking outside
             document.addEventListener('click', function(e) {
                 if (!e.target.matches('#exportDropdown')) {
@@ -1325,16 +929,16 @@ $stats_dynamic = [
         document.addEventListener('DOMContentLoaded', function() {
             initializeCharts();
             startRealtimeUpdates();
-            
+
             // Handle custom date range submission
             const startDateInput = document.getElementById('startDate');
             const endDateInput = document.getElementById('endDate');
-            
+
             if (startDateInput && endDateInput) {
                 startDateInput.addEventListener('change', applyCustomDateRange);
                 endDateInput.addEventListener('change', applyCustomDateRange);
             }
-            
+
             // Close modals on overlay click
             document.querySelectorAll('.modal-overlay').forEach(modal => {
                 modal.addEventListener('click', function(e) {
@@ -1348,11 +952,12 @@ $stats_dynamic = [
         function applyCustomDateRange() {
             const startDate = document.getElementById('startDate').value;
             const endDate = document.getElementById('endDate').value;
-            
+
             if (startDate && endDate) {
                 window.location.href = `?range=custom&start=${startDate}&end=${endDate}`;
             }
         }
     </script>
 </body>
+
 </html>

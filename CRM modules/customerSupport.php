@@ -1,590 +1,6 @@
 <?php
-session_start();
-
-// Backend: connect to Database singleton
-require_once(__DIR__ . '/../config/database.php');
-try {
-    $pdo = Database::getInstance()->getConnection();
-} catch (Exception $e) {
-    die('Database connection error: ' . $e->getMessage());
-}
-
-// Simple auth redirect
-if (!isset($_SESSION['user_id'])) {
-    header('Location: ../login.php');
-    exit();
-}
-
-// Handle view ticket request
-if (isset($_GET['action']) && $_GET['action'] === 'get_ticket_details') {
-    header('Content-Type: application/json');
-    $response = ['success' => false, 'message' => ''];
-    
-    try {
-        $ticket_id = str_replace('#TKT-', '', $_GET['ticket_id'] ?? '');
-        
-        $possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
-        $ticketTable = null;
-        foreach ($possibleTicketTables as $tbl) {
-            $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
-            $stmt->execute([$tbl]);
-            if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
-        }
-        
-        if ($ticketTable) {
-            $stmt = $pdo->prepare("
-                SELECT 
-                    t.*,
-                    c.FirstName, c.LastName, c.Email, c.Phone, c.Address,
-                    u.FirstName AS agent_first, u.LastName AS agent_last, u.Email AS agent_email,
-                    s.StoreName, s.Location AS store_location
-                FROM `{$ticketTable}` t
-                LEFT JOIN customers c ON t.CustomerID = c.CustomerID
-                LEFT JOIN users u ON t.AssignedTo = u.UserID
-                LEFT JOIN stores s ON t.StoreID = s.StoreID
-                WHERE t.TicketID = ?
-            ");
-            $stmt->execute([$ticket_id]);
-            $ticket = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if ($ticket) {
-                $response['success'] = true;
-                $response['ticket'] = [
-                    'id' => '#TKT-' . $ticket['TicketID'],
-                    'customer_name' => trim($ticket['FirstName'] . ' ' . $ticket['LastName']),
-                    'customer_email' => $ticket['Email'],
-                    'customer_phone' => $ticket['Phone'],
-                    'customer_address' => $ticket['Address'],
-                    'subject' => $ticket['Subject'],
-                    'description' => $ticket['Description'],
-                    'category' => $ticket['Category'],
-                    'priority' => $ticket['Priority'],
-                    'status' => $ticket['Status'],
-                    'assigned_to' => trim($ticket['agent_first'] . ' ' . $ticket['agent_last']),
-                    'assigned_email' => $ticket['agent_email'],
-                    'sale_ref' => $ticket['SaleRef'],
-                    'store_name' => $ticket['StoreName'],
-                    'store_location' => $ticket['store_location'],
-                    'contact_method' => $ticket['ContactMethod'],
-                    'due_date' => $ticket['DueDate'] ? date('M d, Y', strtotime($ticket['DueDate'])) : 'Not set',
-                    'tags' => $ticket['Tags'],
-                    'internal_notes' => $ticket['InternalNotes'],
-                    'created_at' => date('M d, Y H:i', strtotime($ticket['CreatedAt'])),
-                    'updated_at' => date('M d, Y H:i', strtotime($ticket['UpdatedAt'])),
-                    'first_response_at' => $ticket['FirstResponseAt'] ? date('M d, Y H:i', strtotime($ticket['FirstResponseAt'])) : 'Not yet',
-                    'feedback_score' => $ticket['FeedbackScore'] ? $ticket['FeedbackScore'] . '/5' : 'No feedback'
-                ];
-            } else {
-                $response['message'] = 'Ticket not found';
-            }
-        }
-    } catch (Exception $e) {
-        $response['message'] = 'Error fetching ticket details: ' . $e->getMessage();
-    }
-    
-    echo json_encode($response);
-    exit();
-}
-
-// Handle create ticket request
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'create_ticket') {
-    header('Content-Type: application/json');
-    $response = ['success' => false, 'message' => ''];
-    
-    try {
-        $possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
-        $ticketTable = null;
-        foreach ($possibleTicketTables as $tbl) {
-            $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
-            $stmt->execute([$tbl]);
-            if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
-        }
-        
-        if (!$ticketTable) {
-            $ticketTable = 'support_tickets';
-            $createTableSQL = "
-                CREATE TABLE IF NOT EXISTS `support_tickets` (
-                    TicketID INT AUTO_INCREMENT PRIMARY KEY,
-                    CustomerID INT NOT NULL,
-                    Category VARCHAR(100) NOT NULL,
-                    Priority VARCHAR(50) NOT NULL,
-                    Subject VARCHAR(255) NOT NULL,
-                    Description TEXT NOT NULL,
-                    SaleRef VARCHAR(100),
-                    AssignedTo INT NOT NULL,
-                    Status VARCHAR(50) DEFAULT 'Open',
-                    CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    FirstResponseAt TIMESTAMP NULL,
-                    FeedbackScore INT NULL,
-                    InternalNotes TEXT,
-                    StoreID INT NULL,
-                    ContactMethod VARCHAR(50) DEFAULT 'Email',
-                    DueDate DATE NULL,
-                    Tags VARCHAR(255),
-                    FOREIGN KEY (CustomerID) REFERENCES customers(CustomerID),
-                    FOREIGN KEY (AssignedTo) REFERENCES users(UserID)
-                )
-            ";
-            $pdo->exec($createTableSQL);
-        }
-        
-        $customer_id = $_POST['customer_id'] ?? '';
-        $category = $_POST['category'] ?? '';
-        $priority = $_POST['priority'] ?? '';
-        $subject = trim($_POST['subject'] ?? '');
-        $description = trim($_POST['description'] ?? '');
-        $sale_ref = trim($_POST['sale_ref'] ?? '');
-        $assigned_to = $_POST['assigned_to'] ?? '';
-        $notes = trim($_POST['notes'] ?? '');
-        $store_id = $_POST['store_id'] ?? null;
-        $contact_method = $_POST['contact_method'] ?? 'Email';
-        $due_date = $_POST['due_date'] ?? null;
-        $tags = trim($_POST['tags'] ?? '');
-        
-        if (empty($customer_id) || empty($category) || empty($priority) || empty($subject) || empty($description) || empty($assigned_to)) {
-            $response['message'] = 'All required fields must be filled';
-            echo json_encode($response);
-            exit();
-        }
-        
-        $categoryMap = [
-            'Product Issue' => 'Product Issue',
-            'Order Issue' => 'Order Issue',
-            'Refund Request' => 'Refund Request',
-            'Billing Issue' => 'Billing Issue',
-            'Technical Support' => 'Technical Support',
-            'Account Issue' => 'Account Issue',
-            'Shipping Issue' => 'Shipping Issue',
-            'Complaint' => 'Complaint',
-            'Inquiry' => 'Inquiry',
-            'Feature Request' => 'Feature Request'
-        ];
-        
-        $category = $categoryMap[$category] ?? $category;
-        
-        $priorityMap = [
-            'Critical' => 'Critical',
-            'High' => 'High',
-            'Medium' => 'Medium',
-            'Low' => 'Low'
-        ];
-        
-        $priority = $priorityMap[$priority] ?? $priority;
-        
-        $stmt = $pdo->prepare("SELECT COUNT(*) FROM customers WHERE CustomerID = ?");
-        $stmt->execute([$customer_id]);
-        if ($stmt->fetchColumn() == 0) {
-            $response['message'] = 'Selected customer does not exist';
-            echo json_encode($response);
-            exit();
-        }
-        
-        $stmt = $pdo->prepare("SELECT COUNT(*) FROM users WHERE UserID = ?");
-        $stmt->execute([$assigned_to]);
-        if ($stmt->fetchColumn() == 0) {
-            $response['message'] = 'Selected agent does not exist';
-            echo json_encode($response);
-            exit();
-        }
-        
-        if (!empty($sale_ref) && !str_contains($sale_ref, '#')) {
-            $sale_ref = '#SALE-' . $sale_ref;
-        }
-        
-        if (!empty($due_date)) {
-            $due_date = date('Y-m-d', strtotime($due_date));
-        } else {
-            $due_date = null;
-        }
-        
-        $stmt = $pdo->prepare("
-            INSERT INTO `{$ticketTable}` 
-            (CustomerID, Category, Priority, Subject, Description, SaleRef, AssignedTo, Status, InternalNotes, StoreID, ContactMethod, DueDate, Tags)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'Open', ?, ?, ?, ?, ?)
-        ");
-        
-        $success = $stmt->execute([
-            $customer_id, $category, $priority, $subject, $description, $sale_ref, $assigned_to, 
-            $notes, $store_id, $contact_method, $due_date, $tags
-        ]);
-        
-        if ($success) {
-            $ticketId = $pdo->lastInsertId();
-            $response['success'] = true;
-            $response['message'] = 'Ticket created successfully!';
-            $response['ticket_id'] = $ticketId;
-        } else {
-            $response['message'] = 'Failed to create ticket in database';
-        }
-    } catch (Exception $e) {
-        $response['message'] = 'Error creating ticket: ' . $e->getMessage();
-    }
-    
-    echo json_encode($response);
-    exit();
-}
-
-// Handle AJAX requests for real-time updates
-if (isset($_GET['action']) && $_GET['action'] === 'get_ticket_updates') {
-    header('Content-Type: application/json');
-    
-    $lastUpdateTime = $_GET['last_update'] ?? '1970-01-01 00:00:00';
-    $response = ['updated' => false, 'tickets' => [], 'stats' => []];
-    
-    try {
-        $possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
-        $ticketTable = null;
-        foreach ($possibleTicketTables as $tbl) {
-            $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
-            $stmt->execute([$tbl]);
-            if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
-        }
-        
-        if ($ticketTable) {
-            $stmt = $pdo->prepare("
-                SELECT t.TicketID AS id, t.CustomerID, t.Subject AS subject, t.Description AS description, 
-                       t.Category AS category, t.Priority AS priority, t.Status AS status, 
-                       t.AssignedTo AS assigned_id, t.CreatedAt AS created, t.UpdatedAt AS updated, 
-                       t.SaleRef AS sale_ref, t.ContactMethod, t.DueDate, t.Tags,
-                       c.FirstName, c.LastName, 
-                       u.FirstName AS agent_first, u.LastName AS agent_last
-                FROM `{$ticketTable}` t
-                LEFT JOIN customers c ON t.CustomerID = c.CustomerID
-                LEFT JOIN users u ON t.AssignedTo = u.UserID
-                WHERE t.UpdatedAt > ? OR t.CreatedAt > ?
-                ORDER BY t.CreatedAt DESC
-                LIMIT 50
-            ");
-            $stmt->execute([$lastUpdateTime, $lastUpdateTime]);
-            $updatedTickets = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            
-            if (count($updatedTickets) > 0) {
-                $response['updated'] = true;
-                foreach ($updatedTickets as $r) {
-                    $custName = trim(($r['FirstName'] ?? '') . ' ' . ($r['LastName'] ?? '')) ?: 'Customer';
-                    $agentName = trim(($r['agent_first'] ?? '') . ' ' . ($r['agent_last'] ?? '')) ?: '—';
-                    $response['tickets'][] = [
-                        'id' => '#TKT-' . ($r['id'] ?? '0'),
-                        'customer' => $custName,
-                        'customer_initials' => getInitials($custName),
-                        'subject' => $r['subject'] ?? '',
-                        'description' => $r['description'] ?? '',
-                        'category' => $r['category'] ?? 'Inquiry',
-                        'priority' => $r['priority'] ?? 'Medium',
-                        'status' => $r['status'] ?? 'Open',
-                        'assigned' => $agentName,
-                        'assigned_initials' => getInitials($agentName),
-                        'created' => isset($r['created']) ? date('M d, Y H:i', strtotime($r['created'])) : '',
-                        'updated' => isset($r['updated']) ? date('M d, Y H:i', strtotime($r['updated'])) : '',
-                        'sale_ref' => $r['sale_ref'] ?? '-',
-                        'contact_method' => $r['ContactMethod'] ?? 'Email',
-                        'due_date' => $r['DueDate'] ? date('M d, Y', strtotime($r['DueDate'])) : '',
-                        'tags' => $r['Tags'] ?? ''
-                    ];
-                }
-                
-                $stats = getTicketStats($pdo, $ticketTable);
-                $response['stats'] = $stats;
-            }
-        }
-    } catch (Exception $e) {
-        $response['error'] = $e->getMessage();
-    }
-    
-    echo json_encode($response);
-    exit();
-}
-
-// Handle filter requests
-if (isset($_GET['action']) && $_GET['action'] === 'filter_tickets') {
-    header('Content-Type: application/json');
-    
-    $filters = [
-        'status' => $_GET['status'] ?? '',
-        'priority' => $_GET['priority'] ?? '',
-        'category' => $_GET['category'] ?? '',
-        'date_range' => $_GET['date_range'] ?? '',
-        'search' => $_GET['search'] ?? ''
-    ];
-    
-    $response = ['tickets' => [], 'total_count' => 0];
-    
-    try {
-        $possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
-        $ticketTable = null;
-        foreach ($possibleTicketTables as $tbl) {
-            $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
-            $stmt->execute([$tbl]);
-            if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
-        }
-        
-        if ($ticketTable) {
-            $filteredTickets = getFilteredTickets($pdo, $ticketTable, $filters);
-            $response['tickets'] = $filteredTickets['tickets'];
-            $response['total_count'] = $filteredTickets['total_count'];
-        }
-    } catch (Exception $e) {
-        $response['error'] = $e->getMessage();
-    }
-    
-    echo json_encode($response);
-    exit();
-}
-
-// Handle update ticket status
-if ($_POST['action'] ?? '' === 'update_ticket_status') {
-    header('Content-Type: application/json');
-    $response = ['success' => false, 'message' => ''];
-    
-    try {
-        $ticket_id = str_replace('#TKT-', '', $_POST['ticket_id'] ?? '');
-        $status = $_POST['status'] ?? '';
-        $feedback_score = $_POST['feedback_score'] ?? null;
-        
-        $possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
-        $ticketTable = null;
-        foreach ($possibleTicketTables as $tbl) {
-            $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
-            $stmt->execute([$tbl]);
-            if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
-        }
-        
-        if ($ticketTable) {
-            $stmt = $pdo->prepare("SELECT Status, FirstResponseAt FROM `{$ticketTable}` WHERE TicketID = ?");
-            $stmt->execute([$ticket_id]);
-            $ticket = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            $updates = ['Status = ?', 'UpdatedAt = NOW()'];
-            $params = [$status];
-            
-            if ($ticket && $ticket['Status'] === 'Open' && $status !== 'Open' && !$ticket['FirstResponseAt']) {
-                $updates[] = 'FirstResponseAt = NOW()';
-            }
-            
-            if ($feedback_score !== null && $feedback_score !== '') {
-                $updates[] = 'FeedbackScore = ?';
-                $params[] = $feedback_score;
-            }
-            
-            $params[] = $ticket_id;
-            
-            $sql = "UPDATE `{$ticketTable}` SET " . implode(', ', $updates) . " WHERE TicketID = ?";
-            $stmt = $pdo->prepare($sql);
-            $stmt->execute($params);
-            
-            $response['success'] = true;
-            $response['message'] = 'Ticket updated successfully!';
-        }
-    } catch (Exception $e) {
-        $response['message'] = 'Error updating ticket: ' . $e->getMessage();
-    }
-    
-    echo json_encode($response);
-    exit();
-}
-
-// Handle export request
-if ($_GET['action'] ?? '' === 'export_tickets') {
-    header('Content-Type: text/csv');
-    header('Content-Disposition: attachment; filename="support_tickets_' . date('Y-m-d') . '.csv"');
-    
-    $output = fopen('php://output', 'w');
-    fputcsv($output, ['Ticket ID', 'Customer', 'Subject', 'Category', 'Priority', 'Status', 'Assigned To', 'Created Date', 'Last Updated', 'Contact Method', 'Due Date']);
-    
-    try {
-        $possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
-        $ticketTable = null;
-        foreach ($possibleTicketTables as $tbl) {
-            $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
-            $stmt->execute([$tbl]);
-            if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
-        }
-        
-        if ($ticketTable) {
-            $stmt = $pdo->prepare("
-                SELECT t.TicketID, t.Subject, t.Category, t.Priority, t.Status, t.CreatedAt, t.UpdatedAt,
-                       t.ContactMethod, t.DueDate,
-                       c.FirstName, c.LastName, u.FirstName AS agent_first, u.LastName AS agent_last
-                FROM `{$ticketTable}` t
-                LEFT JOIN customers c ON t.CustomerID = c.CustomerID
-                LEFT JOIN users u ON t.AssignedTo = u.UserID
-                ORDER BY t.CreatedAt DESC
-            ");
-            $stmt->execute();
-            $tickets = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            
-            foreach ($tickets as $ticket) {
-                $customerName = trim(($ticket['FirstName'] ?? '') . ' ' . ($ticket['LastName'] ?? ''));
-                $agentName = trim(($ticket['agent_first'] ?? '') . ' ' . ($ticket['agent_last'] ?? '')) ?: 'Unassigned';
-                
-                fputcsv($output, [
-                    '#TKT-' . $ticket['TicketID'],
-                    $customerName ?: 'Customer',
-                    $ticket['Subject'],
-                    $ticket['Category'],
-                    $ticket['Priority'],
-                    $ticket['Status'],
-                    $agentName,
-                    $ticket['CreatedAt'],
-                    $ticket['UpdatedAt'],
-                    $ticket['ContactMethod'],
-                    $ticket['DueDate']
-                ]);
-            }
-        }
-    } catch (Exception $e) {
-        // Handle error
-    }
-    
-    fclose($output);
-    exit();
-}
-
-// Helper function to get initials
-function getInitials($name) {
-    $parts = array_filter(explode(' ', $name));
-    $initials = '';
-    foreach ($parts as $part) {
-        $initials .= strtoupper(substr($part, 0, 1));
-    }
-    return $initials ?: '?';
-}
-
-// Function to get ticket statistics
-function getTicketStats($pdo, $ticketTable) {
-    $stats = [];
-    
-    $stmt = $pdo->query("SELECT COUNT(*) FROM `{$ticketTable}`");
-    $stats['totalTickets'] = (int)$stmt->fetchColumn();
-
-    $stmt = $pdo->query("SELECT COUNT(*) FROM `{$ticketTable}` WHERE Status IN ('Open','open')");
-    $stats['openTickets'] = (int)$stmt->fetchColumn();
-
-    $stmt = $pdo->query("SELECT COUNT(*) FROM `{$ticketTable}` WHERE Status IN ('In Progress','in progress','Progress')");
-    $stats['inProgress'] = (int)$stmt->fetchColumn();
-
-    $stmt = $pdo->query("SELECT COUNT(*) FROM `{$ticketTable}` WHERE Status IN ('Resolved','Closed','closed')");
-    $stats['resolved'] = (int)$stmt->fetchColumn();
-
-    $stmt = $pdo->query("SELECT AVG(TIMESTAMPDIFF(HOUR, CreatedAt, FirstResponseAt)) FROM `{$ticketTable}` WHERE FirstResponseAt IS NOT NULL");
-    $stats['avgResponseHours'] = round((float)$stmt->fetchColumn(), 1);
-
-    $stmt = $pdo->query("SELECT COUNT(*) FROM `{$ticketTable}` WHERE FeedbackScore IS NOT NULL");
-    $fbCount = (int)$stmt->fetchColumn();
-    $stats['satisfactionRate'] = 0;
-    if ($fbCount > 0) {
-        $stmt = $pdo->query("SELECT AVG(FeedbackScore) FROM `{$ticketTable}` WHERE FeedbackScore IS NOT NULL");
-        $avgScore = (float)$stmt->fetchColumn();
-        $stats['satisfactionRate'] = round(($avgScore / 5) * 100, 1);
-    }
-    
-    return $stats;
-}
-
-// Function to get filtered tickets
-function getFilteredTickets($pdo, $ticketTable, $filters) {
-    $whereConditions = [];
-    $params = [];
-    
-    if (!empty($filters['status']) && $filters['status'] !== 'All Status') {
-        $statusMap = [
-            'Open' => ['Open','open'],
-            'In Progress' => ['In Progress','in progress','Progress'],
-            'Resolved' => ['Resolved'],
-            'Closed' => ['Closed','closed']
-        ];
-        
-        if (isset($statusMap[$filters['status']])) {
-            $placeholders = implode(',', array_fill(0, count($statusMap[$filters['status']]), '?'));
-            $whereConditions[] = "t.Status IN ($placeholders)";
-            $params = array_merge($params, $statusMap[$filters['status']]);
-        }
-    }
-    
-    if (!empty($filters['priority']) && $filters['priority'] !== 'All Priority') {
-        $whereConditions[] = "t.Priority = ?";
-        $params[] = $filters['priority'];
-    }
-    
-    if (!empty($filters['category']) && $filters['category'] !== 'All Categories') {
-        $whereConditions[] = "t.Category = ?";
-        $params[] = $filters['category'];
-    }
-    
-    if (!empty($filters['date_range']) && $filters['date_range'] !== 'All Time') {
-        $dateConditions = [
-            'Today' => "DATE(t.CreatedAt) = CURDATE()",
-            'This Week' => "YEARWEEK(t.CreatedAt) = YEARWEEK(CURDATE())",
-            'This Month' => "MONTH(t.CreatedAt) = MONTH(CURDATE()) AND YEAR(t.CreatedAt) = YEAR(CURDATE())"
-        ];
-        
-        if (isset($dateConditions[$filters['date_range']])) {
-            $whereConditions[] = $dateConditions[$filters['date_range']];
-        }
-    }
-    
-    if (!empty($filters['search'])) {
-        $searchTerm = '%' . $filters['search'] . '%';
-        $whereConditions[] = "(t.Subject LIKE ? OR t.Description LIKE ? OR c.FirstName LIKE ? OR c.LastName LIKE ? OR t.Tags LIKE ?)";
-        $params = array_merge($params, [$searchTerm, $searchTerm, $searchTerm, $searchTerm, $searchTerm]);
-    }
-    
-    $whereClause = '';
-    if (!empty($whereConditions)) {
-        $whereClause = 'WHERE ' . implode(' AND ', $whereConditions);
-    }
-    
-    $countSql = "SELECT COUNT(*) FROM `{$ticketTable}` t LEFT JOIN customers c ON t.CustomerID = c.CustomerID $whereClause";
-    $stmt = $pdo->prepare($countSql);
-    $stmt->execute($params);
-    $totalCount = (int)$stmt->fetchColumn();
-    
-    $ticketsSql = "
-        SELECT t.TicketID AS id, t.CustomerID, t.Subject AS subject, t.Description AS description, 
-               t.Category AS category, t.Priority AS priority, t.Status AS status, 
-               t.AssignedTo AS assigned_id, t.CreatedAt AS created, t.UpdatedAt AS updated, 
-               t.SaleRef AS sale_ref, t.ContactMethod, t.DueDate, t.Tags,
-               c.FirstName, c.LastName, 
-               u.FirstName AS agent_first, u.LastName AS agent_last
-        FROM `{$ticketTable}` t
-        LEFT JOIN customers c ON t.CustomerID = c.CustomerID
-        LEFT JOIN users u ON t.AssignedTo = u.UserID
-        $whereClause
-        ORDER BY t.CreatedAt DESC 
-        LIMIT 50
-    ";
-    
-    $stmt = $pdo->prepare($ticketsSql);
-    $stmt->execute($params);
-    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    
-    $tickets = [];
-    foreach ($rows as $r) {
-        $custName = trim(($r['FirstName'] ?? '') . ' ' . ($r['LastName'] ?? '')) ?: 'Customer';
-        $agentName = trim(($r['agent_first'] ?? '') . ' ' . ($r['agent_last'] ?? '')) ?: '—';
-        $tickets[] = [
-            'id' => '#TKT-' . ($r['id'] ?? '0'),
-            'customer' => $custName,
-            'customer_initials' => getInitials($custName),
-            'subject' => $r['subject'] ?? '',
-            'description' => $r['description'] ?? '',
-            'category' => $r['category'] ?? 'Inquiry',
-            'priority' => $r['priority'] ?? 'Medium',
-            'status' => $r['status'] ?? 'Open',
-            'assigned' => $agentName,
-            'assigned_initials' => getInitials($agentName),
-            'created' => isset($r['created']) ? date('M d, Y H:i', strtotime($r['created'])) : '',
-            'updated' => isset($r['updated']) ? date('M d, Y H:i', strtotime($r['updated'])) : '',
-            'sale_ref' => $r['sale_ref'] ?? '-',
-            'contact_method' => $r['ContactMethod'] ?? 'Email',
-            'due_date' => $r['DueDate'] ? date('M d, Y', strtotime($r['DueDate'])) : '',
-            'tags' => $r['Tags'] ?? ''
-        ];
-    }
-    
-    return ['tickets' => $tickets, 'total_count' => $totalCount];
-}
+// Include the unified backend
+require_once(__DIR__ . '/../api/crm.php');
 
 // Prepare data holders
 $totalTickets = 0;
@@ -598,12 +14,13 @@ $customersForSelect = [];
 $agentsForSelect = [];
 $storesForSelect = [];
 
-$possibleTicketTables = ['support_tickets','tickets','customer_support','helpdesk_tickets'];
+$possibleTicketTables = ['support_tickets', 'tickets', 'customer_support', 'helpdesk_tickets'];
 $ticketTable = null;
 foreach ($possibleTicketTables as $tbl) {
-    $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
-    $stmt->execute([$tbl]);
-    if ($stmt->fetchColumn() > 0) { $ticketTable = $tbl; break; }
+    if (tableExists($pdo, $tbl)) {
+        $ticketTable = $tbl;
+        break;
+    }
 }
 
 try {
@@ -654,30 +71,122 @@ try {
     $stmt = $pdo->query("SELECT CustomerID, FirstName, LastName, Email, Phone FROM customers ORDER BY FirstName LIMIT 200");
     $customersForSelect = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    $stmt = $pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?");
-    $stmt->execute(['stores']);
-    if ($stmt->fetchColumn() > 0) {
+    if (tableExists($pdo, 'stores')) {
         $stmt2 = $pdo->query("SELECT StoreID, StoreName, Location FROM stores ORDER BY StoreName LIMIT 100");
         $storesForSelect = $stmt2->fetchAll(PDO::FETCH_ASSOC);
     }
-
 } catch (Exception $e) {
     // keep defaults on error
 }
 
 $stats_dynamic = [
-    ['icon'=>'🎫','value'=>number_format($totalTickets),'label'=>'Total Tickets','sublabel'=>'All time','trend'=>'+0.0%','trend_dir'=>'up','color'=>'#dbeafe'],
-    ['icon'=>'🔓','value'=>number_format($openTickets),'label'=>'Open Tickets','sublabel'=>'Awaiting response','trend'=>'','trend_dir'=>'down','color'=>'#fee2e2'],
-    ['icon'=>'⏳','value'=>number_format($inProgress),'label'=>'In Progress','sublabel'=>'Being handled','trend'=>'','trend_dir'=>'up','color'=>'#fef3c7'],
-    ['icon'=>'✅','value'=>number_format($resolved),'label'=>'Resolved','sublabel'=>'Closed tickets','trend'=>'','trend_dir'=>'up','color'=>'#d1fae5'],
-    ['icon'=>'⏱️','value'=>($avgResponseHours ? $avgResponseHours . ' hrs' : 'N/A'),'label'=>'Avg Response Time','sublabel'=>'First response','trend'=>'','trend_dir'=>'up','color'=>'#e9d5ff'],
-    ['icon'=>'📈','value'=>($satisfactionRate ? $satisfactionRate . '%' : 'N/A'),'label'=>'Satisfaction Rate','sublabel'=>'Customer feedback','trend'=>'','trend_dir'=>'up','color'=>'#ddd6fe']
+    ['icon' => '🎫', 'value' => number_format($totalTickets), 'label' => 'Total Tickets', 'sublabel' => 'All time', 'trend' => '+0.0%', 'trend_dir' => 'up', 'color' => '#dbeafe'],
+    ['icon' => '🔓', 'value' => number_format($openTickets), 'label' => 'Open Tickets', 'sublabel' => 'Awaiting response', 'trend' => '', 'trend_dir' => 'down', 'color' => '#fee2e2'],
+    ['icon' => '⏳', 'value' => number_format($inProgress), 'label' => 'In Progress', 'sublabel' => 'Being handled', 'trend' => '', 'trend_dir' => 'up', 'color' => '#fef3c7'],
+    ['icon' => '✅', 'value' => number_format($resolved), 'label' => 'Resolved', 'sublabel' => 'Closed tickets', 'trend' => '', 'trend_dir' => 'up', 'color' => '#d1fae5'],
+    ['icon' => '⏱️', 'value' => ($avgResponseHours ? $avgResponseHours . ' hrs' : 'N/A'), 'label' => 'Avg Response Time', 'sublabel' => 'First response', 'trend' => '', 'trend_dir' => 'up', 'color' => '#e9d5ff'],
+    ['icon' => '📈', 'value' => ($satisfactionRate ? $satisfactionRate . '%' : 'N/A'), 'label' => 'Satisfaction Rate', 'sublabel' => 'Customer feedback', 'trend' => '', 'trend_dir' => 'up', 'color' => '#ddd6fe']
 ];
 
+// Helper function to render ticket rows
+function renderTicketRow($ticket)
+{
+    $statusClass = match ($ticket['status']) {
+        'Open' => 'ticket-status-open',
+        'In Progress' => 'ticket-status-progress',
+        'Resolved' => 'ticket-status-resolved',
+        'Closed' => 'ticket-status-closed',
+        default => 'ticket-status-open'
+    };
+
+    $priorityClass = match ($ticket['priority']) {
+        'Critical' => 'ticket-priority-critical',
+        'High' => 'priority-high',
+        'Medium' => 'priority-medium',
+        'Low' => 'priority-low',
+        default => 'priority-medium'
+    };
+
+    $categoryClass = match ($ticket['category']) {
+        'Product Issue' => 'category-product',
+        'Order Issue' => 'category-order',
+        'Refund Request' => 'category-refund',
+        'Billing Issue' => 'category-billing',
+        'Technical Support' => 'category-technical',
+        'Account Issue' => 'category-account',
+        'Shipping Issue' => 'category-shipping',
+        'Complaint' => 'category-complaint',
+        'Inquiry' => 'category-inquiry',
+        'Feature Request' => 'category-feature',
+        default => 'category-inquiry'
+    };
+
+    ob_start();
+?>
+    <tr>
+        <td><input type="checkbox"></td>
+        <td><span class="contact-id"><?php echo $ticket['id']; ?></span></td>
+        <td>
+            <div class="contact-name-cell">
+                <div class="contact-avatar"><?php echo $ticket['customer_initials']; ?></div>
+                <div class="contact-name-info">
+                    <div class="contact-name-primary"><?php echo $ticket['customer']; ?></div>
+                </div>
+            </div>
+        </td>
+        <td>
+            <div class="ticket-subject">
+                <div class="ticket-subject-title"><?php echo $ticket['subject']; ?></div>
+                <div class="ticket-subject-desc"><?php echo $ticket['description']; ?></div>
+                <?php if ($ticket['sale_ref'] !== '-'): ?>
+                    <div class="ticket-sale-ref">🔗 <?php echo $ticket['sale_ref']; ?></div>
+                <?php endif; ?>
+            </div>
+        </td>
+        <td><span class="category-badge <?php echo $categoryClass; ?>"><?php echo $ticket['category']; ?></span></td>
+        <td><span class="priority-badge <?php echo $priorityClass; ?>"><?php echo $ticket['priority']; ?></span></td>
+        <td><span class="status-badge <?php echo $statusClass; ?>"><?php echo strtoupper($ticket['status']); ?></span></td>
+        <td>
+            <div class="contact-name-cell">
+                <div class="contact-avatar" style="width: 32px; height: 32px; font-size: 12px;"><?php echo $ticket['assigned_initials']; ?></div>
+                <span><?php echo $ticket['assigned']; ?></span>
+            </div>
+        </td>
+        <td><?php echo $ticket['created']; ?></td>
+        <td><?php echo $ticket['updated']; ?></td>
+        <td>
+            <div class="action-buttons">
+                <button class="action-btn" onclick="viewTicket('<?php echo $ticket['id']; ?>')">View</button>
+                <button class="action-btn" onclick="updateTicket('<?php echo $ticket['id']; ?>')">Update</button>
+            </div>
+        </td>
+    </tr>
+<?php
+    return ob_get_clean();
+}
+// Assuming you already have the user ID from session
+$userId = $_SESSION['user_id'] ?? null;
+
+$userInitials = '';
+
+// Fetch user's first name from the database
+if ($userId) {
+    $stmt = $db->prepare("SELECT FirstName FROM users WHERE UserID = ?");
+    $stmt->execute([$userId]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if ($user && !empty($user['FirstName'])) {
+        // Extract initials (first two letters, uppercase)
+        $userInitials = strtoupper(substr($user['FirstName'], 0, 2));
+    } else {
+        $userInitials = 'NA'; // fallback if no name found
+    }
+}
 ?>
 
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -685,12 +194,13 @@ $stats_dynamic = [
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="./styles/crmGlobalStyles.css">
 </head>
+
 <body>
     <nav class="navbar">
         <div class="navbar-inner">
             <div class="brand">
                 <div class="brand-icon">C</div>
-                <span>CRM Enterprise</span>
+                <span>CRM Shoe Retail</span>
             </div>
             <ul class="nav-menu">
                 <li><a href="./CrmDashboard.php">Dashboard</a></li>
@@ -708,7 +218,9 @@ $stats_dynamic = [
                     🔔
                     <span class="notification-badge">12</span>
                 </button>
-                <a href="./crmProfile.php"><div class="user-avatar">CS</div></a>
+                <a href="./crmProfile.php">
+                    <div class="user-avatar"><?php echo htmlspecialchars($userInitials); ?></div>
+                </a>
             </div>
         </div>
     </nav>
@@ -727,10 +239,6 @@ $stats_dynamic = [
                 <p class="page-subtitle">Manage support tickets and customer inquiries</p>
             </div>
             <div class="header-actions">
-                <button class="btn btn-secondary" onclick="generateReports()">
-                    <span>📊</span>
-                    <span>Reports</span>
-                </button>
                 <button class="btn btn-secondary" onclick="exportTickets()">
                     <span>📥</span>
                     <span>Export</span>
@@ -886,7 +394,7 @@ $stats_dynamic = [
                                 <option value="">Choose customer</option>
                                 <?php
                                 foreach ($customersForSelect as $c) {
-                                    $cid = $c['CustomerID'] ?? $c['CustomerID'];
+                                    $cid = $c['CustomerID'];
                                     $name = trim(($c['FirstName'] ?? '') . ' ' . ($c['LastName'] ?? ''));
                                     $email = $c['Email'] ?? '';
                                     $phone = $c['Phone'] ?? '';
@@ -895,7 +403,7 @@ $stats_dynamic = [
                                 ?>
                             </select>
                         </div>
-                        
+
                         <div class="form-group">
                             <label class="form-label">Customer Email</label>
                             <input type="text" class="form-input" id="customerEmail" readonly style="background: #f5f5f5;">
@@ -921,7 +429,7 @@ $stats_dynamic = [
                                 <option value="Feature Request">Feature Request</option>
                             </select>
                         </div>
-                        
+
                         <div class="form-group">
                             <label class="form-label">Priority *</label>
                             <select class="filter-select" name="priority" required>
@@ -953,7 +461,7 @@ $stats_dynamic = [
                             <label class="form-label">Subject *</label>
                             <input type="text" class="form-input" name="subject" placeholder="Brief description of the issue" required>
                         </div>
-                        
+
                         <div class="form-group full-width">
                             <label class="form-label">Description *</label>
                             <textarea class="form-textarea" name="description" placeholder="Detailed description of the issue or inquiry..." required style="min-height: 120px;"></textarea>
@@ -963,15 +471,15 @@ $stats_dynamic = [
                             <label class="form-label">Related Sale ID</label>
                             <input type="text" class="form-input" name="sale_ref" placeholder="#SALE-0000 (optional)">
                         </div>
-                        
+
                         <div class="form-group">
                             <label class="form-label">Store Location</label>
                             <select class="filter-select" name="store_id">
                                 <option value="">Select store</option>
                                 <?php
                                 foreach ($storesForSelect as $s) {
-                                    $sid = $s['StoreID'] ?? $s['StoreID'];
-                                    $sname = $s['StoreName'] ?? $s['StoreName'];
+                                    $sid = $s['StoreID'];
+                                    $sname = $s['StoreName'];
                                     $location = $s['Location'] ?? '';
                                     echo '<option value="' . htmlspecialchars($sid) . '">' . htmlspecialchars($sname) . ($location ? ' - ' . htmlspecialchars($location) : '') . '</option>';
                                 }
@@ -985,7 +493,7 @@ $stats_dynamic = [
                                 <option value="">Select agent</option>
                                 <?php
                                 foreach ($agentsForSelect as $a) {
-                                    $aid = $a['UserID'] ?? $a['UserID'];
+                                    $aid = $a['UserID'];
                                     $aname = trim(($a['FirstName'] ?? '') . ' ' . ($a['LastName'] ?? ''));
                                     $role = $a['Role'] ?? '';
                                     echo '<option value="' . htmlspecialchars($aid) . '">' . htmlspecialchars($aname) . ($role ? ' (' . htmlspecialchars($role) . ')' : '') . '</option>';
@@ -1222,7 +730,9 @@ $stats_dynamic = [
             font-size: 14px;
         }
 
-        .form-input, .filter-select, .form-textarea {
+        .form-input,
+        .filter-select,
+        .form-textarea {
             width: 100%;
             padding: 10px 12px;
             border: 1px solid #d1d5db;
@@ -1231,7 +741,9 @@ $stats_dynamic = [
             transition: all 0.2s;
         }
 
-        .form-input:focus, .filter-select:focus, .form-textarea:focus {
+        .form-input:focus,
+        .filter-select:focus,
+        .form-textarea:focus {
             outline: none;
             border-color: #3b82f6;
             box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
@@ -1308,7 +820,8 @@ $stats_dynamic = [
             font-size: 14px;
         }
 
-        .ticket-status-badge, .ticket-priority-badge {
+        .ticket-status-badge,
+        .ticket-priority-badge {
             padding: 6px 12px;
             border-radius: 6px;
             font-weight: 600;
@@ -1323,7 +836,8 @@ $stats_dynamic = [
             margin: 0;
         }
 
-        .description-content, .notes-content {
+        .description-content,
+        .notes-content {
             background: white;
             padding: 16px;
             border-radius: 6px;
@@ -1367,15 +881,45 @@ $stats_dynamic = [
             font-size: 14px;
         }
 
-        .status-open { background: #dbeafe; color: #1e40af; }
-        .status-progress { background: #fef3c7; color: #92400e; }
-        .status-resolved { background: #d1fae5; color: #065f46; }
-        .status-closed { background: #f3f4f6; color: #4b5563; }
+        .status-open {
+            background: #dbeafe;
+            color: #1e40af;
+        }
 
-        .priority-critical { background: #fecaca; color: #991b1b; }
-        .priority-high { background: #fed7aa; color: #9a3412; }
-        .priority-medium { background: #fef08a; color: #854d0e; }
-        .priority-low { background: #dcfce7; color: #166534; }
+        .status-progress {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .status-resolved {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .status-closed {
+            background: #f3f4f6;
+            color: #4b5563;
+        }
+
+        .priority-critical {
+            background: #fecaca;
+            color: #991b1b;
+        }
+
+        .priority-high {
+            background: #fed7aa;
+            color: #9a3412;
+        }
+
+        .priority-medium {
+            background: #fef08a;
+            color: #854d0e;
+        }
+
+        .priority-low {
+            background: #dcfce7;
+            color: #166534;
+        }
 
         .btn-loading {
             position: relative;
@@ -1398,7 +942,9 @@ $stats_dynamic = [
         }
 
         @keyframes spin {
-            to { transform: rotate(360deg); }
+            to {
+                transform: rotate(360deg);
+            }
         }
 
         .btn {
@@ -1436,6 +982,40 @@ $stats_dynamic = [
         .btn-secondary:hover:not(:disabled) {
             background: #4b5563;
         }
+
+        .realtime-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: #10b981;
+            font-weight: 500;
+        }
+
+        .pulse-dot {
+            width: 8px;
+            height: 8px;
+            background: #10b981;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% {
+                transform: scale(0.95);
+                opacity: 0.7;
+            }
+
+            50% {
+                transform: scale(1.1);
+                opacity: 1;
+            }
+
+            100% {
+                transform: scale(0.95);
+                opacity: 0.7;
+            }
+        }
     </style>
 
     <script>
@@ -1456,16 +1036,16 @@ $stats_dynamic = [
             const selectedOption = customerSelect.options[customerSelect.selectedIndex];
             const email = selectedOption.getAttribute('data-email') || '';
             const phone = selectedOption.getAttribute('data-phone') || '';
-            
+
             document.getElementById('customerEmail').value = email;
             document.getElementById('customerPhone').value = phone;
         }
 
         async function viewTicket(ticketId) {
             try {
-                const response = await fetch(`?action=get_ticket_details&ticket_id=${encodeURIComponent(ticketId)}`);
+                const response = await fetch(`crm.php?action=get_ticket_details&ticket_id=${encodeURIComponent(ticketId)}`);
                 const data = await response.json();
-                
+
                 if (data.success) {
                     displayTicketDetails(data.ticket);
                     openViewModal();
@@ -1480,11 +1060,11 @@ $stats_dynamic = [
         function displayTicketDetails(ticket) {
             document.getElementById('viewTicketId').textContent = ticket.id;
             document.getElementById('viewTicketSubject').textContent = ticket.subject;
-            
+
             const statusBadge = document.getElementById('viewTicketStatus');
             statusBadge.textContent = ticket.status;
             statusBadge.className = 'ticket-status-badge status-' + ticket.status.toLowerCase().replace(' ', '-');
-            
+
             const priorityBadge = document.getElementById('viewTicketPriority');
             priorityBadge.textContent = ticket.priority;
             priorityBadge.className = 'ticket-priority-badge priority-' + ticket.priority.toLowerCase();
@@ -1502,7 +1082,7 @@ $stats_dynamic = [
 
             document.getElementById('viewAssignedTo').textContent = ticket.assigned_to;
             document.getElementById('viewAgentEmail').textContent = ticket.assigned_email || '—';
-            document.getElementById('viewStoreInfo').textContent = ticket.store_name ? 
+            document.getElementById('viewStoreInfo').textContent = ticket.store_name ?
                 `${ticket.store_name}${ticket.store_location ? ' - ' + ticket.store_location : ''}` : '—';
 
             document.getElementById('viewSaleRef').textContent = ticket.sale_ref || '—';
@@ -1546,16 +1126,16 @@ $stats_dynamic = [
 
         async function checkForUpdates() {
             try {
-                const response = await fetch(`?action=get_ticket_updates&last_update=${encodeURIComponent(lastUpdateTime)}`);
+                const response = await fetch(`crm.php?action=get_ticket_updates&last_update=${encodeURIComponent(lastUpdateTime)}`);
                 const data = await response.json();
-                
+
                 if (data.updated) {
                     lastUpdateTime = '<?php echo date('Y-m-d H:i:s'); ?>';
-                    
+
                     if (data.stats) {
                         updateStats(data.stats);
                     }
-                    
+
                     if (data.tickets.length > 0) {
                         showUpdateNotification(data.tickets.length);
                         refreshTickets();
@@ -1586,10 +1166,10 @@ $stats_dynamic = [
                     🔄 ${count} ticket${count > 1 ? 's' : ''} updated. <a href="javascript:void(0)" onclick="refreshTickets()" style="color: white; text-decoration: underline;">Refresh</a>
                 </div>
             `;
-            
+
             const container = document.querySelector('.container');
             container.insertBefore(notification, container.firstChild);
-            
+
             setTimeout(() => {
                 notification.remove();
             }, 5000);
@@ -1603,18 +1183,18 @@ $stats_dynamic = [
                 date_range: document.getElementById('dateFilter').value,
                 search: document.getElementById('globalSearch').value
             };
-            
+
             currentFilters = filters;
-            
+
             try {
                 const params = new URLSearchParams({
                     action: 'filter_tickets',
                     ...filters
                 });
-                
-                const response = await fetch(`?${params}`);
+
+                const response = await fetch(`crm.php?${params}`);
                 const data = await response.json();
-                
+
                 if (!data.error) {
                     updateTicketsTable(data.tickets, data.total_count);
                 } else {
@@ -1630,14 +1210,14 @@ $stats_dynamic = [
             const ticketCount = document.getElementById('ticketCount');
             const totalTicketsCount = document.getElementById('totalTicketsCount');
             const showingRange = document.getElementById('showingRange');
-            
+
             ticketCount.textContent = totalCount;
             totalTicketsCount.textContent = totalCount;
             const showingEnd = Math.min(itemsPerPage, tickets.length);
-            showingRange.innerHTML = `<strong>1-${showingEnd}</strong>`;
-            
+            showingRange.innerHTML = `1-${showingEnd}`;
+
             tbody.innerHTML = '';
-            
+
             tickets.forEach(ticket => {
                 const row = document.createElement('tr');
                 row.innerHTML = `
@@ -1686,7 +1266,7 @@ $stats_dynamic = [
             document.getElementById('categoryFilter').value = 'All Categories';
             document.getElementById('dateFilter').value = 'All Time';
             document.getElementById('globalSearch').value = '';
-            
+
             applyFilters();
         }
 
@@ -1703,7 +1283,7 @@ $stats_dynamic = [
 
         function exportTickets() {
             const filters = currentFilters;
-            const exportUrl = `?action=export_tickets&status=${filters.status}&priority=${filters.priority}&category=${filters.category}&date_range=${filters.date_range}&search=${filters.search}`;
+            const exportUrl = `crm.php?action=export_tickets&status=${filters.status}&priority=${filters.priority}&category=${filters.category}&date_range=${filters.date_range}&search=${filters.search}`;
             window.location.href = exportUrl;
         }
 
@@ -1719,10 +1299,10 @@ $stats_dynamic = [
                     ❌ ${message}
                 </div>
             `;
-            
+
             const container = document.querySelector('.container');
             container.insertBefore(errorDiv, container.firstChild);
-            
+
             setTimeout(() => {
                 errorDiv.remove();
             }, 5000);
@@ -1736,10 +1316,10 @@ $stats_dynamic = [
                     ✅ ${message}
                 </div>
             `;
-            
+
             const container = document.querySelector('.container');
             container.insertBefore(successDiv, container.firstChild);
-            
+
             setTimeout(() => {
                 successDiv.remove();
             }, 5000);
@@ -1769,7 +1349,7 @@ $stats_dynamic = [
         async function saveTicket() {
             const form = document.getElementById('ticketForm');
             const submitBtn = document.getElementById('createTicketBtn');
-            
+
             if (!form.checkValidity()) {
                 form.reportValidity();
                 return;
@@ -1782,13 +1362,13 @@ $stats_dynamic = [
             formData.append('action', 'create_ticket');
 
             try {
-                const response = await fetch('', {
+                const response = await fetch('crm.php', {
                     method: 'POST',
                     body: formData
                 });
-                
+
                 const result = await response.json();
-                
+
                 if (result.success) {
                     showSuccess(result.message);
                     closeTicketModal();
@@ -1815,13 +1395,13 @@ $stats_dynamic = [
             submitBtn.disabled = true;
 
             try {
-                const response = await fetch('', {
+                const response = await fetch('crm.php', {
                     method: 'POST',
                     body: formData
                 });
-                
+
                 const result = await response.json();
-                
+
                 if (result.success) {
                     showSuccess(result.message);
                     closeUpdateModal();
@@ -1852,12 +1432,12 @@ $stats_dynamic = [
             document.getElementById('categoryFilter').addEventListener('change', applyFilters);
             document.getElementById('dateFilter').addEventListener('change', applyFilters);
             document.getElementById('globalSearch').addEventListener('input', applyFilters);
-            
+
             document.getElementById('createTicketBtn').addEventListener('click', saveTicket);
             document.getElementById('updateTicketBtn').addEventListener('click', submitTicketUpdate);
-            
+
             startRealtimeUpdates();
-            
+
             document.getElementById('ticketModal').addEventListener('click', function(e) {
                 if (e.target === this) {
                     closeTicketModal();
@@ -1888,80 +1468,5 @@ $stats_dynamic = [
         });
     </script>
 </body>
+
 </html>
-
-<?php
-function renderTicketRow($ticket) {
-    $statusClass = match($ticket['status']) {
-        'Open' => 'ticket-status-open',
-        'In Progress' => 'ticket-status-progress',
-        'Resolved' => 'ticket-status-resolved',
-        'Closed' => 'ticket-status-closed',
-        default => 'ticket-status-open'
-    };
-
-    $priorityClass = match($ticket['priority']) {
-        'Critical' => 'ticket-priority-critical',
-        'High' => 'priority-high',
-        'Medium' => 'priority-medium',
-        'Low' => 'priority-low',
-        default => 'priority-medium'
-    };
-
-    $categoryClass = match($ticket['category']) {
-        'Product Issue' => 'category-product',
-        'Order Issue' => 'category-order',
-        'Refund Request' => 'category-refund',
-        'Billing Issue' => 'category-billing',
-        'Technical Support' => 'category-technical',
-        'Account Issue' => 'category-account',
-        'Shipping Issue' => 'category-shipping',
-        'Complaint' => 'category-complaint',
-        'Inquiry' => 'category-inquiry',
-        'Feature Request' => 'category-feature',
-        default => 'category-inquiry'
-    };
-    
-    ob_start();
-    ?>
-    <tr>
-        <td><input type="checkbox"></td>
-        <td><span class="contact-id"><?php echo $ticket['id']; ?></span></td>
-        <td>
-            <div class="contact-name-cell">
-                <div class="contact-avatar"><?php echo $ticket['customer_initials']; ?></div>
-                <div class="contact-name-info">
-                    <div class="contact-name-primary"><?php echo $ticket['customer']; ?></div>
-                </div>
-            </div>
-        </td>
-        <td>
-            <div class="ticket-subject">
-                <div class="ticket-subject-title"><?php echo $ticket['subject']; ?></div>
-                <div class="ticket-subject-desc"><?php echo $ticket['description']; ?></div>
-                <?php if ($ticket['sale_ref'] !== '-'): ?>
-                    <div class="ticket-sale-ref">🔗 <?php echo $ticket['sale_ref']; ?></div>
-                <?php endif; ?>
-            </div>
-        </td>
-        <td><span class="category-badge <?php echo $categoryClass; ?>"><?php echo $ticket['category']; ?></span></td>
-        <td><span class="priority-badge <?php echo $priorityClass; ?>"><?php echo $ticket['priority']; ?></span></td>
-        <td><span class="status-badge <?php echo $statusClass; ?>"><?php echo strtoupper($ticket['status']); ?></span></td>
-        <td>
-            <div class="contact-name-cell">
-                <div class="contact-avatar" style="width: 32px; height: 32px; font-size: 12px;"><?php echo $ticket['assigned_initials']; ?></div>
-                <span><?php echo $ticket['assigned']; ?></span>
-            </div>
-        </td>
-        <td><?php echo $ticket['created']; ?></td>
-        <td><?php echo $ticket['updated']; ?></td>
-        <td>
-            <div class="action-buttons">
-                <button class="action-btn" onclick="viewTicket('<?php echo $ticket['id']; ?>')">View</button>
-                <button class="action-btn" onclick="updateTicket('<?php echo $ticket['id']; ?>')">Update</button>
-            </div>
-        </td>
-    </tr>
-    <?php
-    return ob_get_clean();
-}

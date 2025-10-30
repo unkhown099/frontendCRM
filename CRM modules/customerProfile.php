@@ -1,317 +1,29 @@
 <?php
-session_start();
-// Backend: prepare DB-driven data for the Customer Profiles page
-require_once __DIR__ . '/../config/database.php';
+require_once('../api/crm.php');
 
-if (!isset($_SESSION['user_id'])) {
-    header('Location: ../login.php');
-    exit;
-}
+// Assuming you already have the user ID from session
+$userId = $_SESSION['user_id'] ?? null;
 
-$pdo = Database::getInstance()->getConnection();
+$userInitials = '';
 
-// Handle form submissions
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (isset($_POST['action'])) {
-        switch ($_POST['action']) {
-            case 'add_customer':
-                try {
-                    // Generate member number following the format in SQL (MEM-XXX)
-                    $stmt = $pdo->query("SELECT MAX(CAST(SUBSTRING(MemberNumber, 5) AS UNSIGNED)) as max_num FROM customers WHERE MemberNumber LIKE 'MEM-%'");
-                    $result = $stmt->fetch(PDO::FETCH_ASSOC);
-                    $nextNum = ($result['max_num'] ?? 0) + 1;
-                    $memberNumber = 'MEM-' . str_pad($nextNum, 3, '0', STR_PAD_LEFT);
-                    
-                    $stmt = $pdo->prepare("INSERT INTO customers (MemberNumber, FirstName, LastName, Email, Phone, Address, LoyaltyPoints, Status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
-                    $stmt->execute([
-                        $memberNumber,
-                        $_POST['first_name'],
-                        $_POST['last_name'],
-                        $_POST['email'],
-                        $_POST['phone'],
-                        $_POST['address'],
-                        intval($_POST['loyalty_points']),
-                        'Active'
-                    ]);
-                    $_SESSION['success_message'] = "Customer added successfully!";
-                } catch (Exception $e) {
-                    $_SESSION['error_message'] = "Error adding customer: " . $e->getMessage();
-                }
-                break;
-                
-            case 'delete_customer':
-                try {
-                    $customerId = $_POST['customer_id'];
-                    $stmt = $pdo->prepare("DELETE FROM customers WHERE CustomerID = ?");
-                    $stmt->execute([$customerId]);
-                    $_SESSION['success_message'] = "Customer deleted successfully!";
-                } catch (Exception $e) {
-                    $_SESSION['error_message'] = "Error deleting customer: " . $e->getMessage();
-                }
-                break;
-                
-            case 'update_customer':
-                try {
-                    $stmt = $pdo->prepare("UPDATE customers SET FirstName = ?, LastName = ?, Email = ?, Phone = ?, Address = ?, LoyaltyPoints = ?, Status = ? WHERE CustomerID = ?");
-                    $stmt->execute([
-                        $_POST['first_name'],
-                        $_POST['last_name'],
-                        $_POST['email'],
-                        $_POST['phone'],
-                        $_POST['address'],
-                        intval($_POST['loyalty_points']),
-                        $_POST['status'],
-                        $_POST['customer_id']
-                    ]);
-                    $_SESSION['success_message'] = "Customer updated successfully!";
-                } catch (Exception $e) {
-                    $_SESSION['error_message'] = "Error updating customer: " . $e->getMessage();
-                }
-                break;
-        }
-        header("Location: " . $_SERVER['PHP_SELF']);
-        exit;
+// Fetch user's first name from the database
+if ($userId) {
+    $stmt = $db->prepare("SELECT FirstName FROM users WHERE UserID = ?");
+    $stmt->execute([$userId]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if ($user && !empty($user['FirstName'])) {
+        // Extract initials (first two letters, uppercase)
+        $userInitials = strtoupper(substr($user['FirstName'], 0, 2));
+    } else {
+        $userInitials = 'NA'; // fallback if no name found
     }
 }
-
-// Handle export functionality
-if (isset($_GET['export'])) {
-    try {
-        header('Content-Type: text/csv');
-        header('Content-Disposition: attachment; filename="customers_' . date('Y-m-d') . '.csv"');
-        
-        $output = fopen('php://output', 'w');
-        
-        // CSV headers
-        fputcsv($output, ['Customer ID', 'Member Number', 'Name', 'Email', 'Phone', 'Loyalty Points', 'Tier', 'Status', 'Total Purchases', 'Last Purchase']);
-        
-        // Fetch all customers for export
-        $stmt = $pdo->query("
-            SELECT c.CustomerID, c.MemberNumber, c.FirstName, c.LastName, c.Email, c.Phone, c.LoyaltyPoints, c.Status,
-                   COALESCE(SUM(s.TotalAmount), 0) as TotalPurchases,
-                   MAX(s.SaleDate) as LastPurchase
-            FROM customers c
-            LEFT JOIN sales s ON c.CustomerID = s.CustomerID
-            GROUP BY c.CustomerID
-            ORDER BY c.FirstName
-        ");
-        
-        while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-            // Determine tier
-            $points = (int)$row['LoyaltyPoints'];
-            $tier = 'Bronze';
-            if ($points >= 1000) $tier = 'Platinum';
-            elseif ($points >= 500) $tier = 'Gold';
-            elseif ($points >= 100) $tier = 'Silver';
-            
-            $name = trim($row['FirstName'] . ' ' . $row['LastName']);
-            $lastPurchase = $row['LastPurchase'] ? date('M d, Y', strtotime($row['LastPurchase'])) : 'Never';
-            
-            fputcsv($output, [
-                'CUST-' . $row['CustomerID'],
-                $row['MemberNumber'],
-                $name,
-                $row['Email'],
-                $row['Phone'],
-                $points,
-                $tier,
-                $row['Status'],
-                '₱' . number_format($row['TotalPurchases'], 2),
-                $lastPurchase
-            ]);
-        }
-        
-        fclose($output);
-        exit;
-    } catch (Exception $e) {
-        $_SESSION['error_message'] = "Error exporting data: " . $e->getMessage();
-        header("Location: " . $_SERVER['PHP_SELF']);
-        exit;
-    }
-}
-
-// Handle filters
-$filters = [
-    'type' => $_GET['type'] ?? 'all',
-    'tier' => $_GET['tier'] ?? 'all',
-    'status' => $_GET['status'] ?? 'all',
-    'date_range' => $_GET['date_range'] ?? 'all'
-];
-
-$totalCustomers = 0;
-$vipCustomers = 0;
-$totalLoyaltyPoints = 0;
-$newThisMonth = 0;
-$customers = [];
-
-try {
-    $monthStart = date('Y-m-01');
-    $monthEnd = date('Y-m-t');
-
-    // Build filter conditions
-    $whereConditions = [];
-    $params = [];
-    
-    if ($filters['type'] !== 'all') {
-        // For type filter, we'll check loyalty points threshold
-        if ($filters['type'] === 'VIP') {
-            $whereConditions[] = "c.LoyaltyPoints >= 500";
-        } else {
-            $whereConditions[] = "c.LoyaltyPoints < 500";
-        }
-    }
-    
-    if ($filters['status'] !== 'all') {
-        $whereConditions[] = "c.Status = ?";
-        $params[] = $filters['status'];
-    }
-    
-    if ($filters['date_range'] !== 'all') {
-        $dateCondition = "";
-        switch ($filters['date_range']) {
-            case 'this_month':
-                $dateCondition = "c.CreatedAt BETWEEN ? AND ?";
-                $params[] = $monthStart . ' 00:00:00';
-                $params[] = $monthEnd . ' 23:59:59';
-                break;
-            case 'last_3_months':
-                $dateCondition = "c.CreatedAt >= DATE_SUB(NOW(), INTERVAL 3 MONTH)";
-                break;
-            case 'last_6_months':
-                $dateCondition = "c.CreatedAt >= DATE_SUB(NOW(), INTERVAL 6 MONTH)";
-                break;
-            case 'this_year':
-                $dateCondition = "YEAR(c.CreatedAt) = YEAR(NOW())";
-                break;
-        }
-        if ($dateCondition) {
-            $whereConditions[] = $dateCondition;
-        }
-    }
-    
-    // Tier filter
-    if ($filters['tier'] !== 'all') {
-        $tierCondition = "";
-        switch ($filters['tier']) {
-            case 'Bronze':
-                $tierCondition = "c.LoyaltyPoints < 100";
-                break;
-            case 'Silver':
-                $tierCondition = "c.LoyaltyPoints BETWEEN 100 AND 499";
-                break;
-            case 'Gold':
-                $tierCondition = "c.LoyaltyPoints BETWEEN 500 AND 999";
-                break;
-            case 'Platinum':
-                $tierCondition = "c.LoyaltyPoints >= 1000";
-                break;
-        }
-        if ($tierCondition) {
-            $whereConditions[] = $tierCondition;
-        }
-    }
-    
-    $whereClause = $whereConditions ? "WHERE " . implode(" AND ", $whereConditions) : "";
-
-    // total customers with filters
-    $stmt = $pdo->prepare("SELECT COUNT(*) FROM customers c $whereClause");
-    $stmt->execute($params);
-    $totalCustomers = (int)$stmt->fetchColumn();
-
-    // pagination
-    $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
-    $perPage = 10; // rows per page
-    $offset = ($page - 1) * $perPage;
-
-    // VIP customers heuristic: customers with high loyalty points
-    $vipThreshold = 500; // loyalty points threshold for VIP
-    $stmt = $pdo->prepare("SELECT COUNT(*) FROM customers WHERE LoyaltyPoints >= ?");
-    $stmt->execute([$vipThreshold]);
-    $vipCustomers = (int)$stmt->fetchColumn();
-
-    // total loyalty points
-    $stmt = $pdo->query("SELECT IFNULL(SUM(LoyaltyPoints),0) FROM customers");
-    $totalLoyaltyPoints = (int)$stmt->fetchColumn();
-
-    // new customers this month
-    $stmt = $pdo->prepare("SELECT COUNT(*) FROM customers WHERE CreatedAt BETWEEN ? AND ?");
-    $stmt->execute([$monthStart . ' 00:00:00', $monthEnd . ' 23:59:59']);
-    $newThisMonth = (int)$stmt->fetchColumn();
-
-    // Fetch customers with filters
-    $sql = "SELECT CustomerID, MemberNumber, FirstName, LastName, Email, Phone, LoyaltyPoints, Status, CreatedAt 
-            FROM customers c 
-            $whereClause 
-            ORDER BY FirstName 
-            LIMIT ? OFFSET ?";
-    
-    $stmt = $pdo->prepare($sql);
-    $allParams = array_merge($params, [(int)$perPage, (int)$offset]);
-    $stmt->execute($allParams);
-    $custRows = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-    $totalPages = $perPage > 0 ? (int)ceil($totalCustomers / $perPage) : 1;
-
-    foreach ($custRows as $r) {
-        $cid = $r['CustomerID'];
-        $name = trim((($r['FirstName'] ?? '') . ' ' . ($r['LastName'] ?? '')));
-        if ($name === '') $name = 'Customer';
-        $initials = '';
-        foreach (preg_split('/\s+/', $name) as $p) { 
-            $initials .= strtoupper(substr($p,0,1)); 
-        }
-
-        $points = (int)$r['LoyaltyPoints'];
-
-        // total purchases and last purchase
-        $s3 = $pdo->prepare("SELECT IFNULL(SUM(TotalAmount),0) as total, IFNULL(MAX(SaleDate), NULL) as last_sale FROM sales WHERE CustomerID = ?");
-        $s3->execute([$cid]);
-        $salesRow = $s3->fetch(PDO::FETCH_ASSOC);
-        $totalPurchases = $salesRow ? (float)$salesRow['total'] : 0.0;
-        $lastPurchase = $salesRow && $salesRow['last_sale'] ? date('M d, Y', strtotime($salesRow['last_sale'])) : '—';
-
-        // determine tier
-        $tier = 'Bronze';
-        if ($points >= 1000) $tier = 'Platinum';
-        elseif ($points >= 500) $tier = 'Gold';
-        elseif ($points >= 100) $tier = 'Silver';
-
-        $customers[] = [
-            'id' => $cid,
-            'member_number' => $r['MemberNumber'],
-            'display_id' => '#CUST-' . $cid,
-            'name' => $name,
-            'first_name' => $r['FirstName'],
-            'last_name' => $r['LastName'],
-            'initials' => $initials,
-            'email' => $r['Email'] ?? '',
-            'phone' => $r['Phone'] ?? '',
-            'address' => $r['Address'] ?? '',
-            'type' => ($points >= $vipThreshold ? 'VIP' : 'Retail'),
-            'points' => $points,
-            'tier' => $tier,
-            'total_purchases' => '₱' . number_format($totalPurchases,2),
-            'last_purchase' => $lastPurchase,
-            'status' => $r['Status']
-        ];
-    }
-
-} catch (Exception $e) {
-    $_SESSION['error_message'] = "Database error: " . $e->getMessage();
-}
-
-// prepare stats array for UI
-$stats_dynamic = [
-    ['icon'=>'👥','value'=>number_format($totalCustomers),'label'=>'Total Customers','sublabel'=>'Active accounts','trend'=>'+0.0%','trend_dir'=>'up','color'=>'#dbeafe'],
-    ['icon'=>'⭐','value'=>number_format($vipCustomers),'label'=>'VIP Customers','sublabel'=>'Loyalty tier 3+','trend'=>'+0.0%','trend_dir'=>'up','color'=>'#fef3c7'],
-    ['icon'=>'🎁','value'=>number_format($totalLoyaltyPoints),'label'=>'Total Loyalty Points','sublabel'=>'Redeemable','trend'=>'+0.0%','trend_dir'=>'up','color'=>'#e9d5ff'],
-    ['icon'=>'🆕','value'=>number_format($newThisMonth),'label'=>'New This Month','sublabel'=>'vs last month','trend'=>'+0.0%','trend_dir'=>'up','color'=>'#d1fae5']
-];
-
 ?>
 
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -390,22 +102,22 @@ $stats_dynamic = [
             font-size: 12px;
             font-weight: 600;
         }
-        
+
         .status-active {
             color: #10b981;
             font-weight: 600;
         }
-        
+
         .status-inactive {
             color: #ef4444;
             font-weight: 600;
         }
-        
+
         .action-buttons {
             display: flex;
             gap: 8px;
         }
-        
+
         .action-btn {
             padding: 6px 12px;
             border-radius: 4px;
@@ -415,39 +127,39 @@ $stats_dynamic = [
             background: #f3f4f6;
             color: #4b5563;
         }
-        
+
         .action-btn.delete {
             background: #fee2e2;
             color: #dc2626;
         }
-        
+
         .action-btn:hover {
             opacity: 0.8;
         }
-        
+
         .notification {
             padding: 12px 16px;
             border-radius: 8px;
             margin-bottom: 16px;
             font-weight: 500;
         }
-        
+
         .notification.success {
             background: #d1fae5;
             color: #065f46;
             border: 1px solid #a7f3d0;
         }
-        
+
         .notification.error {
             background: #fee2e2;
             color: #991b1b;
             border: 1px solid #fecaca;
         }
-        
+
         .filters-form {
             display: contents;
         }
-        
+
         .filter-submit {
             align-self: end;
             padding: 8px 16px;
@@ -458,11 +170,11 @@ $stats_dynamic = [
             cursor: pointer;
             font-weight: 500;
         }
-        
+
         .filter-submit:hover {
             background: #2563eb;
         }
-        
+
         /* Modal positioning */
         .modal-overlay {
             position: fixed;
@@ -479,12 +191,12 @@ $stats_dynamic = [
             visibility: hidden;
             transition: all 0.3s ease;
         }
-        
+
         .modal-overlay.active {
             opacity: 1;
             visibility: visible;
         }
-        
+
         .modal {
             background: white;
             border-radius: 12px;
@@ -496,11 +208,11 @@ $stats_dynamic = [
             transform: scale(0.9);
             transition: transform 0.3s ease;
         }
-        
+
         .modal-overlay.active .modal {
             transform: scale(1);
         }
-        
+
         .modal-header {
             padding: 20px 24px;
             border-bottom: 1px solid #e5e7eb;
@@ -508,7 +220,7 @@ $stats_dynamic = [
             align-items: center;
             justify-content: between;
         }
-        
+
         .modal-title {
             font-size: 18px;
             font-weight: 600;
@@ -516,7 +228,7 @@ $stats_dynamic = [
             margin: 0;
             flex: 1;
         }
-        
+
         .close-btn {
             background: none;
             border: none;
@@ -525,15 +237,15 @@ $stats_dynamic = [
             color: #6b7280;
             padding: 4px;
         }
-        
+
         .close-btn:hover {
             color: #374151;
         }
-        
+
         .modal-body {
             padding: 24px;
         }
-        
+
         .modal-footer {
             padding: 20px 24px;
             border-top: 1px solid #e5e7eb;
@@ -541,69 +253,71 @@ $stats_dynamic = [
             justify-content: flex-end;
             gap: 12px;
         }
-        
+
         .btn-danger {
             background: #dc2626;
             color: white;
         }
-        
+
         .btn-danger:hover {
             background: #b91c1c;
         }
-        
+
         .form-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 16px;
         }
-        
+
         .form-group {
             display: flex;
             flex-direction: column;
         }
-        
+
         .form-group.full-width {
             grid-column: 1 / -1;
         }
-        
+
         .form-label {
             font-size: 14px;
             font-weight: 500;
             color: #374151;
             margin-bottom: 6px;
         }
-        
-        .form-input, .form-select {
+
+        .form-input,
+        .form-select {
             padding: 10px 12px;
             border: 1px solid #d1d5db;
             border-radius: 6px;
             font-size: 14px;
         }
-        
-        .form-input:focus, .form-select:focus {
+
+        .form-input:focus,
+        .form-select:focus {
             outline: none;
             border-color: #3b82f6;
             box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
         }
-        
+
         .customer-details {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 16px;
             margin-bottom: 20px;
         }
-        
+
         .detail-group {
             display: flex;
             flex-direction: column;
         }
-        
+
         .detail-label {
             font-size: 12px;
             color: #6b7280;
             margin-bottom: 4px;
         }
-        
+
         .detail-value {
             font-size: 14px;
             color: #111827;
@@ -611,12 +325,13 @@ $stats_dynamic = [
         }
     </style>
 </head>
+
 <body>
     <nav class="navbar">
         <div class="navbar-inner">
             <div class="brand">
                 <div class="brand-icon">C</div>
-                <span>CRM Enterprise</span>
+                <span>CRM Shoe Retail</span>
             </div>
             <ul class="nav-menu">
                 <li><a href="./CrmDashboard.php">Dashboard</a></li>
@@ -634,7 +349,9 @@ $stats_dynamic = [
                     🔔
                     <span class="notification-badge">5</span>
                 </button>
-                <a href="./crmProfile.php"><div class="user-avatar">CS</div></a>
+                <a href="./crmProfile.php">
+                    <div class="user-avatar"><?php echo htmlspecialchars($userInitials); ?></div>
+                </a>
             </div>
         </div>
     </nav>
@@ -667,13 +384,15 @@ $stats_dynamic = [
         <!-- Display notifications -->
         <?php if (isset($_SESSION['success_message'])): ?>
             <div class="notification success">
-                <?php echo $_SESSION['success_message']; unset($_SESSION['success_message']); ?>
+                <?php echo $_SESSION['success_message'];
+                unset($_SESSION['success_message']); ?>
             </div>
         <?php endif; ?>
-        
+
         <?php if (isset($_SESSION['error_message'])): ?>
             <div class="notification error">
-                <?php echo $_SESSION['error_message']; unset($_SESSION['error_message']); ?>
+                <?php echo $_SESSION['error_message'];
+                unset($_SESSION['error_message']); ?>
             </div>
         <?php endif; ?>
 
@@ -783,7 +502,7 @@ $stats_dynamic = [
                         // $customers array is prepared by backend queries at the top of the file
                         foreach ($customers as $customer) {
                             // Determine tier badge class
-                            $tierClass = match($customer['tier']) {
+                            $tierClass = match ($customer['tier']) {
                                 'Platinum' => 'tier-platinum',
                                 'Gold' => 'tier-gold',
                                 'Silver' => 'tier-silver',
@@ -791,14 +510,14 @@ $stats_dynamic = [
                             };
 
                             // Determine type badge class
-                            $typeClass = match($customer['type']) {
+                            $typeClass = match ($customer['type']) {
                                 'VIP' => 'type-vip',
                                 'Wholesale' => 'type-wholesale',
                                 default => 'type-retail'
                             };
 
                             $statusClass = $customer['status'] === 'Active' ? 'status-active' : 'status-inactive';
-                            
+
                             echo '<tr>';
                             echo '<td><input type="checkbox" class="row-checkbox"></td>';
                             echo '<td><span class="contact-id">' . $customer['display_id'] . '</span></td>';
@@ -838,8 +557,8 @@ $stats_dynamic = [
             </div>
             <div class="table-footer">
                 <?php
-                    $start = $offset + 1;
-                    $end = min($offset + $perPage, $totalCustomers);
+                $start = $offset + 1;
+                $end = min($offset + $perPage, $totalCustomers);
                 ?>
                 <div class="showing-text">
                     Showing <strong><?php echo $start ?>-<?php echo $end ?></strong> of <strong><?php echo number_format($totalCustomers) ?></strong> customers
@@ -851,7 +570,7 @@ $stats_dynamic = [
 
                     <?php
                     $maxPagesToShow = 7;
-                    $startPage = max(1, min($page - floor($maxPagesToShow/2), max(1, $totalPages - $maxPagesToShow + 1)));
+                    $startPage = max(1, min($page - floor($maxPagesToShow / 2), max(1, $totalPages - $maxPagesToShow + 1)));
                     $endPage = min($startPage + $maxPagesToShow - 1, $totalPages);
                     for ($i = $startPage; $i <= $endPage; $i++):
                     ?>
@@ -910,7 +629,7 @@ $stats_dynamic = [
             </div>
         </div>
     </div>
-    
+
     <!-- View Customer Modal -->
     <div class="modal-overlay" id="viewCustomerModal">
         <div class="modal">
@@ -928,7 +647,7 @@ $stats_dynamic = [
             </div>
         </div>
     </div>
-    
+
     <!-- Edit Customer Modal -->
     <div class="modal-overlay" id="editCustomerModal">
         <div class="modal">
@@ -981,7 +700,7 @@ $stats_dynamic = [
             </div>
         </div>
     </div>
-    
+
     <!-- Delete Confirmation Modal -->
     <div class="modal-overlay" id="deleteModal">
         <div class="modal">
@@ -1006,7 +725,7 @@ $stats_dynamic = [
     <script>
         // Customer data from PHP
         const customers = <?php echo json_encode($customers); ?>;
-        
+
         // Modal Functions
         function openModal(modalId) {
             document.getElementById(modalId).classList.add('active');
@@ -1015,7 +734,7 @@ $stats_dynamic = [
         function closeModal(modalId) {
             document.getElementById(modalId).classList.remove('active');
         }
-        
+
         function viewCustomer(customerId) {
             const customer = customers.find(c => c.id === customerId);
             if (customer) {
@@ -1075,7 +794,7 @@ $stats_dynamic = [
                 openModal('viewCustomerModal');
             }
         }
-        
+
         function editCustomer(customerId) {
             const customer = customers.find(c => c.id === customerId);
             if (customer) {
@@ -1090,7 +809,7 @@ $stats_dynamic = [
                 openModal('editCustomerModal');
             }
         }
-        
+
         function deleteCustomer(customerId, customerName) {
             document.getElementById('deleteCustomerName').textContent = customerName;
             document.getElementById('deleteCustomerId').value = customerId;
@@ -1144,4 +863,5 @@ $stats_dynamic = [
         });
     </script>
 </body>
+
 </html>
