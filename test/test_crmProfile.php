@@ -120,16 +120,20 @@
     ini_set('display_startup_errors', 1);
     error_reporting(E_ALL);
 
+    // Set up test environment
+    $_SESSION['user_id'] = 1; // Set a test user ID
+    
     // Buffered include of module to avoid rendering
     $included = false;
     try {
-      ob_start();
-      require_once(__DIR__ . '/../CRM modules/crmProfile.php');
-      ob_end_clean();
-      $included = true;
+        ob_start();
+        require_once(__DIR__ . '/../CRM modules/crmProfile.php');
+        ob_end_clean();
+        $included = true;
     } catch (Throwable $t) {
-      ob_end_clean();
-      $included = false;
+        ob_end_clean();
+        TestOutput::warning('Include error: ' . $t->getMessage());
+        $included = false;
     }
 
     class TestOutput
@@ -209,6 +213,16 @@
     } catch (Exception $e) {
       TestOutput::failure('DB connection failed: ' . $e->getMessage());
       exit(1);
+    }
+
+    // Helper function to check if a table exists
+    function tableExists($pdo, $table) {
+      try {
+          $result = $pdo->query("SELECT 1 FROM {$table} LIMIT 1");
+          return $result !== false;
+      } catch (Exception $e) {
+          return false;
+      }
     }
 
     // 1. Inclusion & Session

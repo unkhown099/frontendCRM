@@ -285,9 +285,14 @@
         });
 
         runTest("getDateRange() - Last month", function () {
+            $now = new DateTime();
             list($start, $end) = getDateRange('last_month');
-            $lastMonth = date('Y-m', strtotime('last month'));
-            return (date('Y-m', strtotime($start)) === $lastMonth);
+
+            // Expected last month relative to $now, not to the system clock independently
+            $expected = (clone $now)->modify('first day of last month')->format('Y-m');
+            // echo "DEBUG: start=$start, expected=$expected\n";
+
+            return (date('Y-m', strtotime($start)) === $expected);
         });
 
         // Test getInitials function
@@ -618,12 +623,15 @@
         });
 
         runTest("Total pages calculation", function () {
-            $totalRecords = 45;
+            $totalRecords = 3; // or dynamically fetch inside the test
             $perPage = 10;
-            $totalPages = ceil($totalRecords / $perPage);
-            return $totalPages === 5;
+            $expected = ceil($totalRecords / $perPage);
+            $totalPages = calculateTotalPages($totalRecords, $perPage);
+            // echo "DEBUG: totalRecords=$totalRecords, expected=$expected, got=$totalPages\n";
+            return $totalPages === $expected;
         });
 
+        
         // ========================================
         // 8. TEST ERROR HANDLING
         // ========================================

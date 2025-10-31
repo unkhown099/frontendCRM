@@ -16,6 +16,7 @@ if (!isset($_SESSION['user_id'])) {
 }
 
 // Points rate (fallback) - 1 point per ₱10
+global $pointsRate, $pointsRateDisplay;
 $pointsRate = 10;
 $pointsRateDisplay = '₱' . $pointsRate . '/pt';
 

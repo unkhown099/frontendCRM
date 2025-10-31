@@ -129,14 +129,16 @@
     // Attempt to include the module in a buffer to avoid rendering
     $included = false;
     try {
-      ob_start();
-      require_once(__DIR__ . '/../CRM modules/loyaltyProgram.php');
-      ob_end_clean();
-      $included = true;
+        ob_start();
+        require_once(__DIR__ . '/../CRM modules/loyaltyProgram.php');
+        require_once(__DIR__ . '/../api/crm.php'); // or wherever tableExists() is defined
+        ob_end_clean();
+        $included = true;
     } catch (Throwable $t) {
-      ob_end_clean();
-      $included = false;
+        ob_end_clean();
+        $included = false;
     }
+
 
     class TestOutput
     {
@@ -234,10 +236,12 @@
     });
     runTest('pointsRate or pointsRateDisplay present', function () use ($included) {
       if (!$included) return false;
+      global $pointsRate, $pointsRateDisplay;
       return (isset($pointsRate) || isset($pointsRateDisplay));
     });
     runTest('tierSettings available when included', function () use ($included) {
       if (!$included) return false;
+      global $tierSettings;
       return isset($tierSettings) && is_array($tierSettings);
     });
 
